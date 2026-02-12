@@ -14,6 +14,7 @@
 package server
 
 import (
+	"archive/tar"
 	"bytes"
 	"cmp"
 	"encoding/json"
@@ -30,6 +31,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/klauspost/compress/s2"
 	"github.com/nats-io/nuid"
 )
 
@@ -3933,11 +3935,30 @@ func (s *Server) processStreamRestore(ci *ClientInfo, acc *Account, cfg *StreamC
 
 	s.startGoRoutine(func() {
 		defer s.grWG.Done()
-		mset, err := acc.RestoreStream(cfg, pr)
+
+		var mset *stream
+		var err error
+
+		// Determine the snapshot format:
+		// - v1: First file in the tar will be meta.inf
+		// - v2: First file in the tar will be state.json
+		var consumed bytes.Buffer
+		var hdr *tar.Header
+		tee := io.TeeReader(pr, &consumed)
+		tr := tar.NewReader(s2.NewReader(tee))
+		if hdr, err = tr.Next(); err == nil {
+			replay := io.MultiReader(&consumed, pr)
+			switch hdr.Name {
+			case "meta.inf":
+				mset, err = acc.RestoreStream(cfg, replay)
+			case "state.json":
+				mset, err = acc.RestoreStreamV2(cfg, replay)
+			default:
+				err = fmt.Errorf("unknown snapshot version")
+			}
+		}
 		if err != nil {
 			pr.CloseWithError(err)
-		} else {
-			pr.Close()
 		}
 		restoreCh <- struct {
 			mset *stream
@@ -4250,11 +4271,21 @@ func (s *Server) jsStreamSnapshotRequest(sub *subscription, c *client, _ *Accoun
 			Domain: s.getOpts().JetStreamDomain,
 		})
 
-		s.Noticef("Completed snapshot of %s for stream '%s > %s' in %v",
-			friendlyBytes(int64(sr.State.Bytes)),
-			mset.jsa.account.Name,
-			mset.name(),
-			end.Sub(start))
+		if err := <-sr.errCh; err != _EMPTY_ {
+			s.Warnf("Snapshot for stream '%s > %s' failed after %v: %s",
+				mset.jsa.account.Name,
+				mset.name(),
+				end.Sub(start),
+				err,
+			)
+		} else {
+			s.Noticef("Completed snapshot of %s for stream '%s > %s' in %v",
+				friendlyBytes(int64(sr.State.Bytes)),
+				mset.jsa.account.Name,
+				mset.name(),
+				end.Sub(start),
+			)
+		}
 	}()
 }
 
