@@ -9038,6 +9038,12 @@ func (mset *stream) snapshot(deadline time.Duration, checkMsgs, includeConsumers
 		return nil, errStreamClosed
 	}
 	store := mset.store
+	// V2 snapshots intentionally do not run the v1 checkMsgs pre-scan. Unlike
+	// v1's raw file copy, v2 reads each message through LoadNextMsg, which uses
+	// cacheLookup/msgFromBufEx and verifies the per-record checksum when a
+	// freshly loaded cache entry is first read. Corrupt records therefore make
+	// LoadNextMsg fail and abort the snapshot instead of silently entering the
+	// backup.
 	return mset.js.CreateStreamSnapshotV2(store, deadline, includeConsumers, mset.streamAssignment())
 }
 

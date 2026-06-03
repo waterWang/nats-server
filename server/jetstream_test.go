@@ -41,6 +41,7 @@ import (
 	"time"
 
 	"github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nats-server/v2/server/archive"
 	"github.com/nats-io/nats-server/v2/server/ats"
 	"github.com/nats-io/nats-server/v2/server/sysmem"
 	"github.com/nats-io/nats.go"
@@ -3144,7 +3145,7 @@ func TestJetStreamCheckBytesLimitsOverflow(t *testing.T) {
 
 	// addBytes + maxBytesOffset overflow.
 	// In the snapshot-restore path, maxBytesOffset (bc) accumulates from
-	// hdr.Size and can be non-zero when addBytes is near MaxInt64.
+	// hdr.HeaderSize + hdr.PayloadSize and can be non-zero when addBytes is near MaxInt64.
 	// Previously this silently wrapped negative, bypassing the limit.
 	js.mu.RLock()
 	err := js.checkBytesLimits(limits, _EMPTY_, math.MaxInt64, 1, FileStorage, false, 0, 1)
@@ -3442,7 +3443,7 @@ func TestJetStreamSnapshotsAPI(t *testing.T) {
 	o, err := mset.addConsumer(workerModeConfig("WQ"))
 	require_NoError(t, err)
 	// Now grab some messages.
-	toReceive := rand.Intn(toSend) + 1
+	toReceive := rand.Intn(int(mset.state().Msgs)) + 1
 	for r := 0; r < toReceive; r++ {
 		resp, err := nc.Request(o.requestNextMsgSubject(), nil, time.Second)
 		if err != nil {
@@ -3757,46 +3758,175 @@ func TestJetStreamSnapshotsAPI(t *testing.T) {
 	// }
 }
 
-func TestJetStreamSnapshotsAPIMessagePreamble(t *testing.T) {
+func TestJetStreamSnapshotsAPIArchiveMessageLayout(t *testing.T) {
+	var buf bytes.Buffer
+	w := archive.NewWriter(&buf)
+
 	hdr := []byte("NATS/1.0\r\nNats-Msg-Id: X\r\n\r\n")
 	msg := []byte("hello world")
 	subj := "foo.bar"
-	preamble := fmt.Sprintf("%d %d %s\r\n", len(hdr), len(subj), subj)
-
 	body := append(hdr, msg...)
-	r := strings.NewReader(preamble + string(body))
-
-	gotSubj, hlen, err := parseSnapshotMessagePreamble(r, MAX_CONTROL_LINE_SIZE)
+	entry := archive.Header{
+		Name:        subj,
+		Timestamp:   12345,
+		Sequence:    99,
+		HeaderSize:  int64(len(hdr)),
+		PayloadSize: int64(len(msg)),
+	}
+	require_NoError(t, w.WriteHeader(&entry))
+	_, err := w.Write(body)
 	require_NoError(t, err)
-	require_Equal(t, gotSubj, subj)
-	require_Equal(t, hlen, len(hdr))
-}
+	require_NoError(t, w.Close())
 
-func TestJetStreamSnapshotsAPIMessagePreambleAllowsEmptySubject(t *testing.T) {
-	hdr := []byte("NATS/1.0\r\n\r\n")
-	msg := []byte("msg")
-	subj := ""
-	preamble := fmt.Sprintf("%d %d %s\r\n", len(hdr), len(subj), subj)
-
-	body := append(hdr, msg...)
-	r := strings.NewReader(preamble + string(body))
-
-	gotSubj, hlen, err := parseSnapshotMessagePreamble(r, MAX_CONTROL_LINE_SIZE)
+	r := archive.NewReader(bytes.NewReader(buf.Bytes()))
+	gotHdr, err := r.Next()
 	require_NoError(t, err)
-	require_Equal(t, gotSubj, subj)
-	require_Equal(t, hlen, len(hdr))
+	require_Equal(t, subj, gotHdr.Name)
+	require_Equal(t, int64(len(hdr)), gotHdr.HeaderSize)
+	require_Equal(t, int64(len(msg)), gotHdr.PayloadSize)
+	require_Equal(t, uint64(99), gotHdr.Sequence)
+
+	gotBody, err := io.ReadAll(r)
+	require_NoError(t, err)
+	require_True(t, bytes.Equal(body, gotBody))
 }
 
-func TestJetStreamSnapshotsAPIMessagePreambleRejectsMalformedPreamble(t *testing.T) {
-	r := strings.NewReader("10 3 fooX\r\nabc")
-	_, _, err := parseSnapshotMessagePreamble(r, MAX_CONTROL_LINE_SIZE)
-	require_Error(t, err)
+func TestJetStreamSnapshotWithDeletedLastSeq(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Storage:  nats.FileStorage,
+	})
+	require_NoError(t, err)
+
+	for i := 0; i < 10; i++ {
+		_, err := js.Publish("foo", []byte("hello"))
+		require_NoError(t, err)
+	}
+	require_NoError(t, js.DeleteMsg("TEST", 10))
+
+	sc, ss, snapshot := performStreamBackup(t, nc, "TEST")
+	require_Equal(t, ss.LastSeq, uint64(10))
+	require_Equal(t, ss.Msgs, uint64(9))
+
+	require_NoError(t, js.DeleteStream("TEST"))
+	require_True(t, performStreamRestore(t, nc, sc, ss, snapshot))
+
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_Equal(t, si.State.Msgs, uint64(9))
 }
 
-func TestJetStreamSnapshotsAPIMessagePreambleRejectsLargeSubject(t *testing.T) {
-	r := strings.NewReader("10 3 foobar\r\n")
-	_, _, err := parseSnapshotMessagePreamble(r, 1)
-	require_Error(t, err)
+func TestJetStreamSnapshotFailedAdvisoryHasError(t *testing.T) {
+	oldSnapshotAckTimeout := snapshotAckTimeout
+	snapshotAckTimeout = 100 * time.Millisecond
+	defer func() { snapshotAckTimeout = oldSnapshotAckTimeout }()
+
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Storage:  nats.FileStorage,
+	})
+	require_NoError(t, err)
+
+	var x uint32 = 1
+	payload := make([]byte, 4096)
+	for range 20 {
+		for i := range payload {
+			x = x*1664525 + 1013904223
+			payload[i] = byte(x >> 24)
+		}
+		_, err := js.Publish("foo", payload)
+		require_NoError(t, err)
+	}
+
+	advSub := natsSubSync(t, nc, JSAdvisoryStreamSnapshotCompletePre+".TEST")
+	deliver := nats.NewInbox()
+	snapSub, err := nc.SubscribeSync(deliver)
+	require_NoError(t, err)
+	defer snapSub.Unsubscribe()
+
+	req, err := json.Marshal(&JSApiStreamSnapshotRequest{
+		DeliverSubject: deliver,
+		ChunkSize:      1024,
+		WindowSize:     1024,
+	})
+	require_NoError(t, err)
+	respMsg, err := nc.Request(fmt.Sprintf(JSApiStreamSnapshotT, "TEST"), req, time.Second)
+	require_NoError(t, err)
+
+	var resp JSApiStreamSnapshotResponse
+	require_NoError(t, json.Unmarshal(respMsg.Data, &resp))
+	require_True(t, resp.Error == nil)
+
+	msg, err := snapSub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_True(t, len(msg.Data) > 0)
+	// Intentionally do not ack the chunk so the snapshot fails with no flow response.
+
+	advMsg, err := advSub.NextMsg(5 * time.Second)
+	require_NoError(t, err)
+
+	var advisory struct {
+		Error json.RawMessage `json:"error,omitempty"`
+	}
+	require_NoError(t, json.Unmarshal(advMsg.Data, &advisory))
+	require_True(t, len(advisory.Error) > 0 && string(advisory.Error) != "null")
+}
+
+func TestJetStreamRestoreSkipsExpiredLastSeq(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:        "TEST",
+		Subjects:    []string{"foo"},
+		Storage:     nats.FileStorage,
+		AllowMsgTTL: true,
+	})
+	require_NoError(t, err)
+
+	_, err = js.Publish("foo", []byte("live"))
+	require_NoError(t, err)
+
+	msg := nats.NewMsg("foo")
+	msg.Header.Set(JSMessageTTL, "1s")
+	msg.Data = []byte("expires")
+	_, err = js.PublishMsg(msg)
+	require_NoError(t, err)
+
+	sc, ss, snapshot := performStreamBackup(t, nc, "TEST")
+	require_Equal(t, ss.LastSeq, uint64(2))
+	require_Equal(t, ss.Msgs, uint64(2))
+
+	time.Sleep(2 * time.Second)
+
+	require_NoError(t, js.DeleteStream("TEST"))
+	require_True(t, performStreamRestore(t, nc, sc, ss, snapshot))
+
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_Equal(t, si.State.LastSeq, uint64(2))
+	require_Equal(t, si.State.Msgs, uint64(1))
+
+	pa, err := js.Publish("foo", []byte("next"))
+	require_NoError(t, err)
+	require_Equal(t, pa.Sequence, uint64(3))
 }
 
 func TestJetStreamSnapshotsAPIRestoreLimits(t *testing.T) {
@@ -10549,8 +10679,12 @@ func TestJetStreamServerEncryption(t *testing.T) {
 				checkKeyFile(filepath.Join(sdir, JetStreamMetaFileKey))
 				checkFor(filepath.Join(sdir, JetStreamMetaFile), "TEST", "foo", "bar", "baz", "max_msgs", "max_bytes")
 				// Check a message block.
-				checkKeyFile(filepath.Join(sdir, "msgs", "1.key"))
-				checkFor(filepath.Join(sdir, "msgs", "1.blk"), "ENCRYPTED PAYLOAD!!", "foo", "bar", "baz")
+				blocks, err := filepath.Glob(filepath.Join(sdir, "msgs", "*.blk"))
+				require_NoError(t, err)
+				require_True(t, len(blocks) > 0)
+				block := blocks[0]
+				checkKeyFile(strings.TrimSuffix(block, ".blk") + ".key")
+				checkFor(block, "ENCRYPTED PAYLOAD!!", "foo", "bar", "baz")
 
 				// Check consumer meta and state.
 				checkKeyFile(filepath.Join(sdir, "obs", "dlc", JetStreamMetaFileKey))
@@ -10627,7 +10761,7 @@ func TestJetStreamServerEncryption(t *testing.T) {
 
 			nacc := ns.GlobalAccount()
 			r := bytes.NewReader(snapshot)
-			mset, err = nacc.RestoreStream(&scfg, r)
+			mset, err = nacc.RestoreStreamV2(&scfg, r)
 			require_NoError(t, err)
 			ss := mset.store.State()
 			if ss.Msgs != si.State.Msgs || ss.FirstSeq != si.State.FirstSeq || ss.LastSeq != si.State.LastSeq {
@@ -10641,7 +10775,7 @@ func TestJetStreamServerEncryption(t *testing.T) {
 
 			acc = s.GlobalAccount()
 			r.Reset(snapshot)
-			mset, err = acc.RestoreStream(&scfg, r)
+			mset, err = acc.RestoreStreamV2(&scfg, r)
 			require_NoError(t, err)
 			ss = mset.store.State()
 			if ss.Msgs != si.State.Msgs || ss.FirstSeq != si.State.FirstSeq || ss.LastSeq != si.State.LastSeq {

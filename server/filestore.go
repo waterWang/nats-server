@@ -12161,7 +12161,7 @@ func (fs *fileStore) stop(delete, writeState bool) error {
 const errFile = "errors.txt"
 
 // Stream our snapshot through S2 compression and tar.
-func (fs *fileStore) streamSnapshot(w io.WriteCloser, includeConsumers bool, errCh chan string) {
+func (fs *fileStore) streamSnapshot(w io.WriteCloser, includeConsumers bool, errCh chan error) {
 	defer close(errCh)
 	defer w.Close()
 
@@ -12198,8 +12198,8 @@ func (fs *fileStore) streamSnapshot(w io.WriteCloser, includeConsumers bool, err
 		return nil
 	}
 
-	writeErr := func(err string) {
-		writeFile(errFile, []byte(err))
+	writeErr := func(err error) {
+		writeFile(errFile, []byte(err.Error()))
 		errCh <- err
 	}
 
@@ -12210,7 +12210,7 @@ func (fs *fileStore) streamSnapshot(w io.WriteCloser, includeConsumers bool, err
 	meta, err := json.Marshal(fs.cfg)
 	if err != nil {
 		fs.mu.Unlock()
-		writeErr(fmt.Sprintf("Could not gather stream meta file: %v", err))
+		writeErr(fmt.Errorf("could not gather stream meta file: %w", err))
 		return
 	}
 	hh := fs.hh
@@ -12243,7 +12243,7 @@ func (fs *fileStore) streamSnapshot(w io.WriteCloser, includeConsumers bool, err
 		bbuf, err = mb.loadBlock(bbuf)
 		if err != nil {
 			mb.mu.Unlock()
-			writeErr(fmt.Sprintf("Could not read message block [%d]: %v", mb.index, err))
+			writeErr(fmt.Errorf("could not read message block [%d]: %w", mb.index, err))
 			return
 		}
 		// Check for encryption.
@@ -12251,7 +12251,7 @@ func (fs *fileStore) streamSnapshot(w io.WriteCloser, includeConsumers bool, err
 			rbek, err := genBlockEncryptionKey(fs.fcfg.Cipher, mb.seed, mb.nonce)
 			if err != nil {
 				mb.mu.Unlock()
-				writeErr(fmt.Sprintf("Could not create encryption key for message block [%d]: %v", mb.index, err))
+				writeErr(fmt.Errorf("could not create encryption key for message block [%d]: %w", mb.index, err))
 				return
 			}
 			rbek.XORKeyStream(bbuf, bbuf)
@@ -12259,7 +12259,7 @@ func (fs *fileStore) streamSnapshot(w io.WriteCloser, includeConsumers bool, err
 		// Check for compression.
 		if bbuf, err = mb.decompressIfNeeded(bbuf); err != nil {
 			mb.mu.Unlock()
-			writeErr(fmt.Sprintf("Could not decompress message block [%d]: %v", mb.index, err))
+			writeErr(fmt.Errorf("could not decompress message block [%d]: %w", mb.index, err))
 			return
 		}
 		mb.mu.Unlock()
@@ -12315,7 +12315,7 @@ func (fs *fileStore) streamSnapshot(w io.WriteCloser, includeConsumers bool, err
 		meta, err := json.Marshal(o.cfg)
 		if err != nil {
 			o.mu.Unlock()
-			writeErr(fmt.Sprintf("Could not gather consumer meta file for %q: %v", o.name, err))
+			writeErr(fmt.Errorf("could not gather consumer meta file for %q: %w", o.name, err))
 			return
 		}
 		o.hh.Reset()
@@ -12327,7 +12327,7 @@ func (fs *fileStore) streamSnapshot(w io.WriteCloser, includeConsumers bool, err
 		state, err := o.encodeState()
 		if err != nil {
 			o.mu.Unlock()
-			writeErr(fmt.Sprintf("Could not encode consumer state for %q: %v", o.name, err))
+			writeErr(fmt.Errorf("could not encode consumer state for %q: %w", o.name, err))
 			return
 		}
 		odirPre := filepath.Join(consumerDir, o.name)
@@ -12390,7 +12390,7 @@ func (fs *fileStore) Snapshot(deadline time.Duration, checkMsgs, includeConsumer
 	fs.FastState(&state)
 
 	// Stream in separate Go routine.
-	errCh := make(chan string, 1)
+	errCh := make(chan error, 1)
 	go fs.streamSnapshot(pw, includeConsumers, errCh)
 
 	return &SnapshotResult{pr, state, errCh}, nil

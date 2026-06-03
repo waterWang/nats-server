@@ -9015,9 +9015,16 @@ func TestJetStreamClusterStreamSnapshots(t *testing.T) {
 					}
 					// Each consumer acked (n+1)*10 of its 60 messages.
 					// Total acked: 10+20+30+40+50 = 150 of 300.
-					si, err := js.StreamInfo("test_stream")
-					require_NoError(t, err)
-					require_Equal(t, si.State.Msgs, 150)
+					checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+						si, err := js.StreamInfo("test_stream")
+						if err != nil {
+							return err
+						}
+						if si.State.Msgs != 150 {
+							return fmt.Errorf("expected 150 messages, got %d", si.State.Msgs)
+						}
+						return nil
+					})
 				},
 			} {
 				t.Run(name, func(t *testing.T) {

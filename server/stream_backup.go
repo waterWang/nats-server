@@ -14,19 +14,18 @@
 package server
 
 import (
-	"archive/tar"
-	"bufio"
-	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
-	"path/filepath"
-	"strconv"
+	"path"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/klauspost/compress/s2"
+	"github.com/nats-io/nats-server/v2/server/archive"
 )
 
 type SnapshotConsumerState struct {
@@ -49,33 +48,33 @@ func (js *jetStream) CreateStreamSnapshotV2(store StreamStore, deadline time.Dur
 	store.FastState(&state)
 
 	// Stream in separate Go routine.
-	errCh := make(chan string, 1)
+	errCh := make(chan error, 1)
 	go js.streamSnapshotV2(store, &state, pw, includeConsumers, sa, errCh)
 
 	return &SnapshotResult{pr, state, errCh}, nil
 }
 
-// Stream our snapshot through S2 compression and tar.
-func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w io.WriteCloser, includeConsumers bool, sa *streamAssignment, errCh chan string) {
+// Stream our snapshot through S2 compression and the custom archive format.
+func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w io.WriteCloser, includeConsumers bool, sa *streamAssignment, errCh chan error) {
 	defer close(errCh)
 	defer w.Close()
 
 	enc := s2.NewWriter(w)
 	defer enc.Close()
 
-	tw := tar.NewWriter(enc)
+	tw := archive.NewWriter(enc)
 	defer tw.Close()
 
 	now := time.Now()
 	clustered := js.isClustered()
 
-	writeGeneric := func(name string, mod time.Time, buf []byte) error {
-		hdr := &tar.Header{
-			Name:    name,
-			Mode:    0600,
-			ModTime: mod.UTC(),
-			Size:    int64(len(buf)),
-			Format:  tar.FormatPAX,
+	writeGeneric := func(name string, mod int64, seq uint64, headerSize, payloadSize int64, buf []byte) error {
+		hdr := &archive.Header{
+			Name:        name,
+			Timestamp:   mod,
+			Sequence:    seq,
+			HeaderSize:  headerSize,
+			PayloadSize: payloadSize,
 		}
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
@@ -83,18 +82,19 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 		if _, err := tw.Write(buf); err != nil {
 			return err
 		}
+		// Need to wait for flush here as the tar/s2 writer is handing off to a
+		// flow-controlled publisher, it's important that we handle backpressure.
 		return tw.Flush()
 	}
 
-	var msgw bytes.Buffer
 	writeStoreMsg := func(msg *StoreMsg) error {
-		msgw.Reset()
-		msgw.WriteString(fmt.Sprintf("%d %d %s\r\n", len(msg.hdr), len(msg.subj), msg.subj))
-		msgw.Write(msg.buf)
 		return writeGeneric(
-			filepath.Join("msgs", fmt.Sprintf("%d", msg.seq)),
-			time.Unix(0, msg.ts),
-			msgw.Bytes(),
+			msg.subj,
+			msg.ts,
+			msg.seq,
+			int64(len(msg.hdr)),
+			int64(len(msg.msg)),
+			msg.buf,
 		)
 	}
 
@@ -104,8 +104,11 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 			return err
 		}
 		return writeGeneric(
-			filepath.Join("consumers", scs.Name),
-			now,
+			path.Join("consumers", scs.Name),
+			now.UnixNano(),
+			0,
+			0,
+			int64(len(ssj)),
 			ssj,
 		)
 	}
@@ -113,10 +116,15 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 	// If we aren't including consumers here then make sure the consumer count
 	// is set accordingly, this helps on the restore path.
 	var consumerAssignments map[string]*consumerAssignment
+	var consumerStores []ConsumerStore
 	var streamState = *state
 	if !includeConsumers {
 		streamState.Consumers = 0
 	} else if clustered {
+		if sa == nil {
+			errCh <- errors.New("stream assignment not present in clustered mode")
+			return
+		}
 		js.mu.RLock()
 		consumerAssignments = make(map[string]*consumerAssignment, len(sa.consumers))
 		for name, ca := range sa.consumers {
@@ -124,15 +132,18 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 		}
 		streamState.Consumers = len(consumerAssignments)
 		js.mu.RUnlock()
+	} else {
+		consumerStores = slices.Collect(store.Consumers())
+		streamState.Consumers = len(consumerStores)
 	}
 
 	ssj, err := json.Marshal(streamState)
 	if err != nil {
-		errCh <- err.Error()
+		errCh <- err
 		return
 	}
-	if err := writeGeneric("state.json", now, ssj); err != nil {
-		errCh <- err.Error()
+	if err := writeGeneric("state.json", now.UnixNano(), 0, 0, int64(len(ssj)), ssj); err != nil {
+		errCh <- err
 		return
 	}
 
@@ -179,37 +190,33 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 		}
 
 		if clustered {
-			if sa == nil {
-				errCh <- "stream assignment not present in clustered mode"
-				return
-			}
 			for _, ca := range consumerAssignments {
 				ci, err := sysRequest[ConsumerInfo](js.srv, clusterConsumerInfoT, sa.Client.serviceAccount(), sa.Config.Name, ca.Name)
 				if err != nil || ci == nil {
-					errCh <- fmt.Sprintf("failed to get consumer state for '%s > %s'", sa.Config.Name, ca.Name)
+					errCh <- fmt.Errorf("failed to get consumer state for '%s > %s'", sa.Config.Name, ca.Name)
 					return
 				}
 				if err := writeConsumerMsg(SnapshotConsumerState{
 					ConsumerConfig: ca.Config,
 					ConsumerState:  consumerStateFromInfo(ci),
 				}); err != nil {
-					errCh <- err.Error()
+					errCh <- err
 					return
 				}
 			}
 		} else {
-			for o := range store.Consumers() {
+			for _, o := range consumerStores {
 				config := o.GetConfig()
 				state, err := o.State()
 				if err != nil {
-					errCh <- fmt.Sprintf("couldn't load consumer '%s' state: %s", config.Name, err)
+					errCh <- fmt.Errorf("couldn't load consumer '%s' state: %s", config.Name, err)
 					return
 				}
 				if err := writeConsumerMsg(SnapshotConsumerState{
 					ConsumerConfig: config,
 					ConsumerState:  state,
 				}); err != nil {
-					errCh <- err.Error()
+					errCh <- err
 					return
 				}
 			}
@@ -219,20 +226,31 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 	var sm StoreMsg
 	for seq := state.FirstSeq - 1; seq < state.LastSeq; {
 		if _, seq, err = store.LoadNextMsg(fwcs, true, seq+1, &sm); err != nil {
-			errCh <- fmt.Sprintf("couldn't load next message after seq %d: %s", seq+1, err)
+			if err == ErrStoreEOF {
+				break
+			}
+			errCh <- fmt.Errorf("couldn't load next message after seq %d: %s", seq+1, err)
 			return
 		}
 		if err = writeStoreMsg(&sm); err != nil {
-			errCh <- err.Error()
+			errCh <- err
 			return
 		}
+	}
+
+	// End of backup sentinel. A clear marker makes it obvious when
+	// a backup has been truncated or not without having to count
+	// messages or from first/last sequence, which may not be possible
+	// during the rewrite of a large stream backup.
+	if err = writeGeneric(_EMPTY_, 0, 0, 0, 0, nil); err != nil {
+		errCh <- err
 	}
 }
 
 // RestoreStreamSnapshotV2 will restore a stream from a snapshot.
 func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (*stream, error) {
 	dec := s2.NewReader(r)
-	tr := tar.NewReader(dec)
+	tr := archive.NewReader(dec)
 
 	var nstate StreamState
 
@@ -307,7 +325,7 @@ func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (*stream, err
 		if err != nil {
 			return nil, err
 		}
-		bc += hdr.Size
+		bc += hdr.HeaderSize + hdr.PayloadSize
 		js.mu.RLock()
 		err = js.checkAllLimits(&selected, tier, &cfg, reserved, bc)
 		js.mu.RUnlock()
@@ -338,23 +356,39 @@ func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (*stream, err
 		}
 	}
 
-	mcl := a.srv.getOpts().MaxControlLine
 	store := mset.store
 	lseq := nstate.FirstSeq - 1
-	br := &bufio.Reader{}
-	for range nstate.Msgs {
+	eob := false
+	for {
 		hdr, err := tr.Next()
 		if err != nil {
 			return nil, err
 		}
-		seqstr, found := strings.CutPrefix(hdr.Name, "msgs/")
-		if !found {
-			return nil, fmt.Errorf("expected message")
+		seq := hdr.Sequence
+		if seq == 0 {
+			// Sentinel "end of backup" if all fields are zero.
+			if hdr.Timestamp == 0 && hdr.HeaderSize == 0 && hdr.PayloadSize == 0 {
+				eob = true
+				break
+			}
+			return nil, fmt.Errorf("expected message sequence")
 		}
-		seq, err := strconv.ParseUint(filepath.Base(seqstr), 10, 64)
+		if hdr.HeaderSize < 0 || hdr.PayloadSize < 0 {
+			return nil, fmt.Errorf("invalid message lengths for sequence %d", seq)
+		}
+		buf, err := io.ReadAll(tr)
 		if err != nil {
-			return nil, fmt.Errorf("expected valid sequence number: %w", err)
+			return nil, fmt.Errorf("failed to read message sequence %d: %w", seq, err)
 		}
+		if hdr.HeaderSize > int64(len(buf)) {
+			return nil, fmt.Errorf("failed to parse message sequence %d: invalid header length", seq)
+		}
+		if int64(len(buf)) != hdr.HeaderSize+hdr.PayloadSize {
+			return nil, fmt.Errorf("failed to read message sequence %d: unexpected payload size", seq)
+		}
+		subj := hdr.Name
+		mhdr := buf[:hdr.HeaderSize]
+		msg := buf[hdr.HeaderSize : hdr.HeaderSize+hdr.PayloadSize]
 		if seq <= lseq {
 			return nil, fmt.Errorf("message sequence %d out of order", seq)
 		}
@@ -366,19 +400,6 @@ func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (*stream, err
 			}
 		}
 		lseq = seq
-		br.Reset(tr)
-		subj, hlen, err := parseSnapshotMessagePreamble(br, int(mcl))
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse preamble line: %w", err)
-		}
-		buf, err := io.ReadAll(br)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read message sequence %d: %w", seq, err)
-		}
-		if hlen > len(buf) {
-			return nil, fmt.Errorf("failed to parse message sequence %d: invalid preamble header content", seq)
-		}
-		mhdr, msg := buf[:hlen], buf[hlen:]
 		switch cfg.Storage {
 		case MemoryStorage:
 			bc += int64(memStoreMsgSize(subj, mhdr, msg))
@@ -395,51 +416,31 @@ func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (*stream, err
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse message TTL: %w", err)
 		}
-		if ttl > 0 && time.Now().After(hdr.ModTime.Add(time.Duration(ttl)*time.Second)) {
-			// If the TTL has exceeded then there isn't much point in storing the message.
+		hdrTime := time.Unix(0, hdr.Timestamp)
+		if ttl > 0 && time.Now().After(hdrTime.Add(time.Duration(ttl)*time.Second)) {
+			// If the TTL has exceeded then there isn't much point in storing the message,
+			// but we still need to preserve the sequence.
+			if err := store.SkipMsgs(seq, 1); err != nil {
+				return nil, fmt.Errorf("failed to process expired message sequence %d: %w", seq, err)
+			}
 			continue
 		}
-		if err = store.StoreRawMsg(subj, mhdr, msg, seq, hdr.ModTime.UnixNano(), ttl, false); err != nil {
+		if err = store.StoreRawMsg(subj, mhdr, msg, seq, hdr.Timestamp, ttl, false); err != nil {
 			return nil, fmt.Errorf("failed to store message sequence %d: %w", seq, err)
 		}
 	}
 
-	if _, err := tr.Next(); err != io.EOF {
-		return nil, fmt.Errorf("unexpected trailing entries")
+	if !eob {
+		return mset, fmt.Errorf("backup was truncated")
 	}
 
+	// Need to make sure that we pad out with skip msgs to preserve the last
+	// sequence, otherwise trailing deleted messages could reuse sequence numbers.
+	if lseq < nstate.LastSeq {
+		gap := nstate.LastSeq - lseq
+		if err := store.SkipMsgs(lseq+1, gap); err != nil {
+			return nil, fmt.Errorf("failed to process trailing gap: %w", err)
+		}
+	}
 	return mset, nil
-}
-
-func parseSnapshotMessagePreamble(r io.Reader, msl int) (string, int, error) {
-	var hlen, slen int
-	if _, err := fmt.Fscanf(r, "%d %d", &hlen, &slen); err != nil {
-		return "", 0, err
-	}
-	if hlen < 0 || slen < 0 || slen > msl {
-		return "", 0, fmt.Errorf("invalid lengths")
-	}
-
-	var sep [1]byte
-	if _, err := io.ReadFull(r, sep[:]); err != nil {
-		return "", 0, err
-	}
-	if sep[0] != ' ' {
-		return "", 0, fmt.Errorf("missing subject separator")
-	}
-
-	subj := make([]byte, slen)
-	if _, err := io.ReadFull(r, subj); err != nil {
-		return "", 0, err
-	}
-
-	var eol [2]byte
-	if _, err := io.ReadFull(r, eol[:]); err != nil {
-		return "", 0, err
-	}
-	if !bytes.Equal(eol[:], []byte("\r\n")) {
-		return "", 0, fmt.Errorf("missing preamble terminator")
-	}
-
-	return string(subj), hlen, nil
 }
