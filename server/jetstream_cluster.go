@@ -2982,7 +2982,7 @@ func (js *jetStream) createRaftGroup(accName string, rg *raftGroup, recovering b
 	}
 
 	// If this is a single peer raft group or we are not a member return.
-	if len(rg.Peers) <= 1 || !rg.isMember(cc.meta.ID()) {
+	if (rg.Desired == nil && len(rg.Peers) <= 1) || !rg.isMember(cc.meta.ID()) {
 		// Nothing to do here.
 		return nil, nil
 	}
@@ -3011,39 +3011,6 @@ retry:
 			goto retry
 		}
 		s.Debugf("JetStream cluster already has raft group %q assigned", rg.Name)
-		// Check and see if the group has the same peers. If not then we
-		// will update the known peers, which will send a peerstate if leader.
-		groupPeerIDs := append([]string{}, rg.Peers...)
-		var samePeers bool
-		if nodePeers := node.Peers(); len(rg.Peers) == len(nodePeers) {
-			nodePeerIDs := make([]string, 0, len(nodePeers))
-			for _, n := range nodePeers {
-				nodePeerIDs = append(nodePeerIDs, n.ID)
-			}
-			slices.Sort(groupPeerIDs)
-			slices.Sort(nodePeerIDs)
-			samePeers = slices.Equal(groupPeerIDs, nodePeerIDs)
-		}
-		if !samePeers {
-			// At this point we have no way of knowing:
-			// 1. Whether the group has lost enough nodes to cause a quorum
-			//    loss, in which case a proposal may fail, therefore we will
-			//    force a peerstate write;
-			// 2. Whether nodes in the group have other applies queued up
-			//    that could change the peerstate again, therefore the leader
-			//    should send out a new proposal anyway too just to make sure
-			//    that this change gets captured in the log.
-			node.UpdateKnownPeers(groupPeerIDs)
-
-			// If the peers changed as a result of an update by the meta layer, we must reflect that in the log of
-			// this group. Otherwise, a new peer would come up and instantly reset the peer state back to whatever is
-			// in the log at that time, overwriting what the meta layer told it.
-			// Will need to address this properly later on, by for example having the meta layer decide the new
-			// placement, but have the leader of this group propose it through its own log instead.
-			if node.Leader() {
-				node.ProposeKnownPeers(groupPeerIDs)
-			}
-		}
 		rg.node = node
 		return node, nil
 	}
@@ -5278,9 +5245,9 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 	}
 
 	js.mu.RLock()
-	s, rg := js.srv, sa.Group
+	s, rg, desired := js.srv, sa.Group, sa.Group.Desired
 	client, subject, reply := sa.Client, sa.Subject, sa.Reply
-	alreadyRunning, oldNumReplicas, numReplicas := osa.Group.node != nil, len(osa.Group.Peers), len(rg.Peers)
+	alreadyRunning, numReplicas := osa.Group.node != nil, len(rg.Peers)
 	needsNode := rg.node == nil
 	storage, cfg := sa.Config.Storage, sa.Config
 	recovering := sa.recovering
@@ -5303,7 +5270,7 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 			js.mu.Unlock()
 		}
 
-		if !alreadyRunning && numReplicas > 1 {
+		if !alreadyRunning && (numReplicas > 1 || desired != nil) {
 			if needsNode {
 				// Must run before startClusterSubs reads mset.sa.Sync.
 				mset.setStreamAssignment(sa)
@@ -5333,7 +5300,7 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 			if !started {
 				mset.monitorWg.Done()
 			}
-		} else if numReplicas == 1 && alreadyRunning {
+		} else if numReplicas == 1 && desired == nil && alreadyRunning {
 			// We downgraded to R1. Make sure we cleanup the raft node and the stream monitor.
 			mset.removeNode()
 			mset.stopMonitoring()
@@ -5387,7 +5354,8 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 	isLeader := mset.IsLeader()
 
 	// If the stream is scaled down, there is a chance we weren't already the leader.
-	if isLeader && numReplicas == 1 && oldNumReplicas > 1 {
+	// FIXME(mvv): does this always run now for any single-replica stream update?
+	if isLeader && numReplicas == 1 && desired == nil {
 		js.processStreamLeaderChange(mset, true, 0)
 	}
 
@@ -6196,7 +6164,7 @@ func (js *jetStream) processClusterCreateConsumer(oca, ca *consumerAssignment, s
 				needsLocalResponse = true
 			}
 			// If we look like we are scaling up, let's send our current state to the group.
-			sendState = len(ca.Group.Peers) > len(oca.Group.Peers) && o.IsLeader() && n != nil
+			sendState = (len(ca.Group.Peers) > len(oca.Group.Peers) || ca.Group.Desired != nil) && o.IsLeader() && n != nil
 			// Signal that this is an update
 			if ca.Reply != _EMPTY_ {
 				isConfigUpdate = true
@@ -6291,7 +6259,7 @@ func (js *jetStream) processClusterCreateConsumer(oca, ca *consumerAssignment, s
 			o.setCreatedTime(ca.Created)
 		} else {
 			// Check for scale down to 1..
-			if node != nil && len(rg.Peers) == 1 {
+			if node != nil && len(rg.Peers) == 1 && rg.Desired == nil {
 				o.clearNode()
 				o.stopMonitoring()
 				// Need to clear from rg too.
