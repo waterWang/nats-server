@@ -165,8 +165,58 @@ type raftGroup struct {
 	Cluster   string      `json:"cluster,omitempty"`
 	Preferred string      `json:"preferred,omitempty"`
 	ScaleUp   bool        `json:"scale_up,omitempty"`
+	// Desired holds the target placement while this group is being moved or
+	// scaled; it is nil when the group is stable.
+	Desired *desiredRaftGroup `json:"desired,omitempty"`
 	// Internal
 	node RaftNode
+}
+
+// desiredGroupPlacement specifies the desired peer set.
+// A stream or consumer raftGroup can be scaled or moved safely based on this desired state.
+type desiredRaftGroup struct {
+	ID        string   `json:"id"`
+	Leader    string   `json:"leader,omitempty"`
+	Name      string   `json:"name"`
+	Peers     []string `json:"peers"`
+	Cluster   string   `json:"cluster,omitempty"`
+	Preferred string   `json:"preferred,omitempty"`
+
+	ScaleUp   bool `json:"scale_up,omitempty"`
+	ScaleDown bool `json:"scale_down,omitempty"`
+
+	// A move can be canceled if a rollback is specified.
+	Rollback *desiredRaftGroupRollback `json:"rollback,omitempty"`
+}
+
+type desiredRaftGroupRollback struct {
+	Placement *Placement `json:"placement,omitempty"`
+}
+
+// withDesired returns a copy of rg with target expressed as the desired state.
+// target MUST already be a copy or fresh group, as it's directly referenced.
+func (rg *raftGroup) withDesired(target *raftGroup) *raftGroup {
+	// When scaling up from a single replica, set it as preferred, as it has the data.
+	if len(rg.Peers) == 1 {
+		target.Preferred = rg.Peers[0]
+	} else if target.Preferred != _EMPTY_ && !slices.Contains(target.Peers, target.Preferred) {
+		// Don't carry a stale preferred into the desired group.
+		target.Preferred = _EMPTY_
+	}
+	var leader string
+	if target.Desired != nil {
+		leader = target.Desired.Leader
+	}
+	ng := rg.copyGroup()
+	ng.Desired = &desiredRaftGroup{
+		ID:        nuid.Next(),
+		Leader:    leader,
+		Name:      target.Name,
+		Peers:     target.Peers,
+		Cluster:   target.Cluster,
+		Preferred: target.Preferred,
+	}
+	return ng
 }
 
 // streamAssignment is what the meta controller uses to assign streams to peers.
@@ -2504,19 +2554,38 @@ func (js *jetStream) setConsumerAssignmentRecovering(ca *consumerAssignment) {
 // Just copies over and changes out the group so it can be encoded.
 // Lock should be held.
 func (sa *streamAssignment) copyGroup() *streamAssignment {
-	csa, cg := sa.clone(), *sa.Group
-	csa.Group = &cg
-	csa.Group.Peers = copyStrings(sa.Group.Peers)
+	csa := sa.clone()
+	csa.Group = sa.Group.copyGroup()
 	return csa
 }
 
 // Just copies over and changes out the group so it can be encoded.
 // Lock should be held.
 func (ca *consumerAssignment) copyGroup() *consumerAssignment {
-	cca, cg := ca.clone(), *ca.Group
-	cca.Group = &cg
-	cca.Group.Peers = copyStrings(ca.Group.Peers)
+	cca := ca.clone()
+	cca.Group = ca.Group.copyGroup()
 	return cca
+}
+
+// copyGroup returns a copy of rg whose Peers slice and nested Desired placement
+// are independent of the original, so it can be mutated and encoded.
+// Lock should be held.
+func (rg *raftGroup) copyGroup() *raftGroup {
+	if rg == nil {
+		return nil
+	}
+	cg := *rg
+	cg.Peers = copyStrings(rg.Peers)
+	if rg.Desired != nil {
+		cd := *rg.Desired
+		cd.Peers = copyStrings(rg.Desired.Peers)
+		if rg.Desired.Rollback != nil {
+			cr := *rg.Desired.Rollback
+			cd.Rollback = &cr
+		}
+		cg.Desired = &cd
+	}
+	return &cg
 }
 
 // Lock should be held.
