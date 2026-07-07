@@ -382,9 +382,8 @@ type ClusterInfo struct {
 // DesiredClusterInfo shows information of the desired set of servers
 // that should make up the stream or consumer.
 type DesiredClusterInfo struct {
-	Name      string      `json:"name,omitempty"`
-	RaftGroup string      `json:"raft_group,omitempty"`
-	Replicas  []*PeerInfo `json:"replicas,omitempty"`
+	Name     string      `json:"name,omitempty"`
+	Replicas []*PeerInfo `json:"replicas,omitempty"`
 	// A move can be canceled if a rollback is specified.
 	Rollback *DesiredClusterInfoRollback `json:"rollback,omitempty"`
 }
