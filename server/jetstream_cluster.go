@@ -71,6 +71,9 @@ type jetStreamCluster struct {
 	// Processing assignment results.
 	streamResults   *subscription
 	consumerResults *subscription
+	// Processing desired assignment reconciliation.
+	streamReconcile   *subscription
+	consumerReconcile *subscription
 	// System level request to have the leader stepdown.
 	stepdown *subscription
 	// System level requests to remove a peer.
@@ -7617,9 +7620,181 @@ func (js *jetStream) processConsumerAssignmentResults(sub *subscription, c *clie
 	}
 }
 
+type streamAssignmentReconcile struct {
+	Account string `json:"account"` // Account of the stream.
+	Stream  string `json:"stream"`  // The stream name itself.
+	desiredAssignmentUpdate
+}
+
+type consumerAssignmentReconcile struct {
+	Account  string `json:"account"`  // Account of the consumer.
+	Stream   string `json:"stream"`   // Stream of the consumer.
+	Consumer string `json:"consumer"` // The consumer name itself.
+	desiredAssignmentUpdate
+}
+
+type desiredAssignmentUpdate struct {
+	Leader string `json:"leader"`       // Leader consistency ID.
+	ID     string `json:"id,omitempty"` // Desired state ID. Empty if there is no desired state yet.
+
+	// The below fields are mutually exclusive.
+	ScaleDownPeers []string `json:"scale_down_peers,omitempty"` // If the desired state was about scaledown, this is the selected peer set.
+	ActualPeers    []string `json:"actual_peers,omitempty"`     // Actual peer set should be updated.
+}
+
+// reconcileDesiredStreamAssignment runs on the meta leader and reconciles a stream's assignment.
+func (js *jetStream) reconcileDesiredStreamAssignment(_ *subscription, _ *client, _ *Account, _, _ string, msg []byte) {
+	var reconcile streamAssignmentReconcile
+	decoder := json.NewDecoder(bytes.NewReader(msg))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&reconcile); err != nil {
+		return
+	}
+	// Fields are mutually exclusive.
+	if reconcile.ScaleDownPeers != nil && reconcile.ActualPeers != nil {
+		return
+	}
+
+	js.mu.Lock()
+	defer js.mu.Unlock()
+
+	cc := js.cluster
+	if cc == nil || cc.meta == nil {
+		return
+	}
+	osa := js.streamAssignmentOrInflight(reconcile.Account, reconcile.Stream)
+	if osa == nil || osa.Group == nil || osa.unsupported != nil || reconcile.Leader == _EMPTY_ {
+		return
+	}
+	ng := osa.Group.reconcileDesiredGroup(reconcile.desiredAssignmentUpdate, osa.Config.Replicas)
+	if ng == nil {
+		return
+	}
+	sa := osa.copyGroup()
+	sa.Group = ng
+	if err := cc.meta.Propose(encodeUpdateStreamAssignment(sa)); err != nil {
+		return
+	}
+	cc.trackInflightStreamProposal(reconcile.Account, sa, false)
+}
+
+// reconcileDesiredConsumerAssignment runs on the meta leader and reconciles a consumer's assignment.
+func (js *jetStream) reconcileDesiredConsumerAssignment(_ *subscription, _ *client, _ *Account, _, _ string, msg []byte) {
+	var reconcile consumerAssignmentReconcile
+	decoder := json.NewDecoder(bytes.NewReader(msg))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&reconcile); err != nil {
+		return
+	}
+	// Fields are mutually exclusive.
+	if reconcile.ScaleDownPeers != nil && reconcile.ActualPeers != nil {
+		return
+	}
+
+	js.mu.Lock()
+	defer js.mu.Unlock()
+
+	cc := js.cluster
+	if cc == nil || cc.meta == nil {
+		return
+	}
+
+	oca := js.consumerAssignmentOrInflight(reconcile.Account, reconcile.Stream, reconcile.Consumer)
+	if oca == nil || oca.Group == nil || oca.unsupported != nil || reconcile.Leader == _EMPTY_ {
+		return
+	}
+	ng := oca.Group.reconcileDesiredGroup(reconcile.desiredAssignmentUpdate, oca.Config.Replicas)
+	if ng == nil {
+		return
+	}
+	ca := oca.copyGroup()
+	ca.Group = ng
+	if err := cc.meta.Propose(encodeAddConsumerAssignment(ca)); err != nil {
+		return
+	}
+	cc.trackInflightConsumerProposal(reconcile.Account, reconcile.Stream, ca, false)
+}
+
+func (rg *raftGroup) reconcileDesiredGroup(reconcile desiredAssignmentUpdate, replicas int) *raftGroup {
+	// Initialize desired state if not set.
+	// FIXME(mvv): test with pre-existing move state without desired.
+	if rg.Desired == nil {
+		// Request is about state that we don't have.
+		if reconcile.ID != _EMPTY_ {
+			return nil
+		}
+		ng := rg.copyGroup()
+		newPeers, _, _, _ := genPeerInfo(rg.Peers, replicas)
+		ng.Peers = newPeers
+		ng = rg.withDesired(ng)
+		ng.Desired.Leader = reconcile.Leader
+		return ng
+	}
+
+	// Skip if this request is not about our latest desired state.
+	if rg.Desired.ID == _EMPTY_ || rg.Desired.ID != reconcile.ID {
+		return nil
+	}
+
+	// Desired state is set, but the leader's ID in our desired state MUST match that of the request.
+	// The group leader waits with sending update requests until it sees its own leader ID. The desired
+	// state ID is updated to prevent the group leader from sending an update request early.
+	if rg.Desired.Leader == _EMPTY_ || rg.Desired.Leader != reconcile.Leader {
+		ng := rg.copyGroup()
+		ng.Desired.ID = nuid.Next()
+		ng.Desired.Leader = reconcile.Leader
+		return ng
+	}
+
+	// A scale down requires selected peers to scale down to first. The group leader is allowed to pick
+	// a subset of the passed desired peer set.
+	if rg.Desired.ScaleDown {
+		if reconcile.ScaleDownPeers == nil {
+			return nil
+		}
+		// All scale down peers should be a subset, ignore if not.
+		for _, peer := range reconcile.ScaleDownPeers {
+			if !slices.Contains(rg.Desired.Peers, peer) {
+				return nil
+			}
+		}
+		// Reset scaledown and save the selected peers.
+		ng := rg.copyGroup()
+		ng.Desired.ID = nuid.Next()
+		ng.Desired.ScaleDown = false
+		ng.Desired.Peers = reconcile.ScaleDownPeers
+		return ng
+	}
+
+	// Final check to make sure it's about an actual peer set update.
+	if reconcile.ActualPeers == nil {
+		return nil
+	}
+
+	// Always update the actual peers.
+	ng := rg.copyGroup()
+	ng.Peers = reconcile.ActualPeers
+
+	desiredPeers := copyStrings(rg.Desired.Peers)
+	slices.Sort(desiredPeers)
+	slices.Sort(reconcile.ActualPeers)
+	if exactMatch := slices.Equal(desiredPeers, reconcile.ActualPeers); exactMatch {
+		// We're done, reset the desired state fields and finalize the assignment.
+		ng.Cluster = rg.Desired.Cluster
+		ng.Preferred = _EMPTY_
+		ng.Desired = nil
+	} else {
+		// Still converging toward the desired peer set.
+		ng.Desired.ID = nuid.Next()
+	}
+	return ng
+}
+
 const (
-	streamAssignmentSubj   = "$SYS.JSC.STREAM.ASSIGNMENT.RESULT"
-	consumerAssignmentSubj = "$SYS.JSC.CONSUMER.ASSIGNMENT.RESULT"
+	streamAssignmentSubj            = "$SYS.JSC.STREAM.ASSIGNMENT.RESULT"
+	streamAssignmentReconcileSubj   = "$SYS.JSC.STREAM.ASSIGNMENT.RECONCILE"
+	consumerAssignmentSubj          = "$SYS.JSC.CONSUMER.ASSIGNMENT.RESULT"
+	consumerAssignmentReconcileSubj = "$SYS.JSC.CONSUMER.ASSIGNMENT.RECONCILE"
 )
 
 // Lock should be held.
@@ -7630,6 +7805,12 @@ func (js *jetStream) startUpdatesSub() {
 	}
 	if cc.consumerResults == nil {
 		cc.consumerResults, _ = s.systemSubscribe(consumerAssignmentSubj, _EMPTY_, false, c, js.processConsumerAssignmentResults)
+	}
+	if cc.streamReconcile == nil {
+		cc.streamReconcile, _ = s.systemSubscribe(streamAssignmentReconcileSubj, _EMPTY_, false, c, js.reconcileDesiredStreamAssignment)
+	}
+	if cc.consumerReconcile == nil {
+		cc.consumerReconcile, _ = s.systemSubscribe(consumerAssignmentReconcileSubj, _EMPTY_, false, c, js.reconcileDesiredConsumerAssignment)
 	}
 	if cc.stepdown == nil {
 		cc.stepdown, _ = s.systemSubscribe(JSApiLeaderStepDown, _EMPTY_, false, c, s.jsLeaderStepDownRequest)
@@ -7658,6 +7839,14 @@ func (js *jetStream) stopUpdatesSub() {
 	if cc.consumerResults != nil {
 		cc.s.sysUnsubscribe(cc.consumerResults)
 		cc.consumerResults = nil
+	}
+	if cc.streamReconcile != nil {
+		cc.s.sysUnsubscribe(cc.streamReconcile)
+		cc.streamReconcile = nil
+	}
+	if cc.consumerReconcile != nil {
+		cc.s.sysUnsubscribe(cc.consumerReconcile)
+		cc.consumerReconcile = nil
 	}
 	if cc.stepdown != nil {
 		cc.s.sysUnsubscribe(cc.stepdown)
