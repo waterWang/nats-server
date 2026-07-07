@@ -11046,72 +11046,130 @@ func (js *jetStream) clusterInfo(rg *raftGroup) *ClusterInfo {
 	}
 	js.mu.RLock()
 	s := js.srv
-	if rg == nil || rg.node == nil {
+	if rg == nil || (rg.node == nil && rg.Desired == nil) {
 		js.mu.RUnlock()
 		return &ClusterInfo{
 			Name:   s.cachedClusterName(),
 			Leader: s.Name(),
 		}
 	}
-
 	// Capture what we need and let go of the lock to ensure that
 	// contention on Raft locks can't happen while holding JS lock.
 	n := rg.node
 	rgName := rg.Name
-	rgPeers := slices.Clone(rg.Peers)
+	rgPeers := copyStrings(rg.Peers)
+	var (
+		desired      *DesiredClusterInfo
+		desiredPeers []string
+	)
+	if d := rg.Desired; d != nil {
+		desired = &DesiredClusterInfo{
+			Name:      d.Cluster,
+			RaftGroup: d.Name,
+		}
+		// If desired state can be rolled back, include what can be rolled back to.
+		if d.Rollback != nil {
+			desired.Rollback = &DesiredClusterInfoRollback{
+				Placement: d.Rollback.Placement,
+			}
+		}
+		desiredPeers = copyStrings(d.Peers)
+	}
 	js.mu.RUnlock()
 
 	ci := &ClusterInfo{
-		Name:        s.cachedClusterName(),
-		Leader:      s.serverNameForNode(n.GroupLeader()),
-		LeaderSince: n.LeaderSince(),
-		SystemAcc:   n.IsSystemAccount(),
-		TrafficAcc:  n.GetTrafficAccountName(),
-		RaftGroup:   rgName,
+		Name:      s.cachedClusterName(),
+		RaftGroup: rgName,
+		Leader:    s.Name(),
 	}
 
-	now := time.Now()
-	id, peers := n.ID(), n.Peers()
+	id := s.Node()
+	if n != nil {
+		ci.Leader = s.serverNameForNode(n.GroupLeader())
+		ci.LeaderSince = n.LeaderSince()
+		ci.SystemAcc = n.IsSystemAccount()
+		ci.TrafficAcc = n.GetTrafficAccountName()
 
-	// If we are leaderless, do not suppress putting us in the peer list.
-	if ci.Leader == _EMPTY_ {
-		id = _EMPTY_
-	}
-
-	for _, rp := range peers {
-		if rp.ID != id && slices.Contains(rgPeers, rp.ID) {
-			var lastSeen time.Duration
-			if now.After(rp.Last) && !rp.Last.IsZero() {
-				lastSeen = now.Sub(rp.Last)
-			}
-			current := rp.Current
-			if current && lastSeen > lostQuorumInterval {
-				current = false
-			}
-			// Create a peer info with common settings if the peer has not been seen
-			// yet (which can happen after the whole cluster is stopped and only some
-			// of the nodes are restarted).
-			pi := &PeerInfo{
-				Current: current,
-				Offline: true,
-				Active:  lastSeen,
-				Lag:     rp.Lag,
-				Peer:    rp.ID,
-			}
-			// If node is found, complete/update the settings.
-			if sir, ok := s.nodeToInfo.Load(rp.ID); ok && sir != nil {
-				si := sir.(nodeInfo)
-				pi.Name, pi.Offline, pi.cluster = si.name, si.offline, si.cluster
-			} else {
-				// If not, then add a name that indicates that the server name
-				// is unknown at this time, and clear the lag since it is misleading
-				// (the node may not have that much lag).
-				// Note: We return now the Peer ID in PeerInfo, so the "(peerID: %s)"
-				// would technically not be required, but keeping it for now.
-				pi.Name, pi.Lag = fmt.Sprintf("Server name unknown at this time (peerID: %s)", rp.ID), 0
-			}
-			ci.Replicas = append(ci.Replicas, pi)
+		// If we are leaderless, do not suppress putting us in the peer list.
+		if ci.Leader == _EMPTY_ {
+			id = _EMPTY_
 		}
+
+		now := time.Now()
+		for _, rp := range n.Peers() {
+			// The peer is either in the actual or desired peer set.
+			if rp.ID != id && (slices.Contains(rgPeers, rp.ID) || slices.Contains(desiredPeers, rp.ID)) {
+				var lastSeen time.Duration
+				if now.After(rp.Last) && !rp.Last.IsZero() {
+					lastSeen = now.Sub(rp.Last)
+				}
+				current := rp.Current
+				if current && lastSeen > lostQuorumInterval {
+					current = false
+				}
+				// Create a peer info with common settings if the peer has not been seen
+				// yet (which can happen after the whole cluster is stopped and only some
+				// of the nodes are restarted).
+				pi := &PeerInfo{
+					Current: current,
+					Offline: true,
+					Active:  lastSeen,
+					Lag:     rp.Lag,
+					Peer:    rp.ID,
+				}
+				// If node is found, complete/update the settings.
+				if sir, ok := s.nodeToInfo.Load(rp.ID); ok && sir != nil {
+					si := sir.(nodeInfo)
+					pi.Name, pi.Offline, pi.cluster = si.name, si.offline, si.cluster
+				} else {
+					// If not, then add a name that indicates that the server name
+					// is unknown at this time, and clear the lag since it is misleading
+					// (the node may not have that much lag).
+					// Note: We return now the Peer ID in PeerInfo, so the "(peerID: %s)"
+					// would technically not be required, but keeping it for now.
+					pi.Name, pi.Lag = fmt.Sprintf("Server name unknown at this time (peerID: %s)", rp.ID), 0
+				}
+				ci.Replicas = append(ci.Replicas, pi)
+			}
+		}
+	}
+
+	generatePeer := func(peer string) *PeerInfo {
+		pi := &PeerInfo{
+			Current: false,
+			Offline: true,
+			Peer:    peer,
+		}
+		// If node is found, complete/update the settings.
+		if sir, ok := s.nodeToInfo.Load(peer); ok && sir != nil {
+			si := sir.(nodeInfo)
+			pi.Name, pi.Offline, pi.cluster = si.name, si.offline, si.cluster
+		} else {
+			// If not, then add a name that indicates that the server name
+			// is unknown at this time, and clear the lag since it is misleading
+			// (the node may not have that much lag).
+			// Note: We return now the Peer ID in PeerInfo, so the "(peerID: %s)"
+			// would technically not be required, but keeping it for now.
+			pi.Name = fmt.Sprintf("Server name unknown at this time (peerID: %s)", peer)
+		}
+		return pi
+	}
+	if desired != nil {
+		ci.Desired = desired
+		for _, peer := range desiredPeers {
+			pi := generatePeer(peer)
+			if peer == id {
+				pi.Current = true
+			}
+			ci.Desired.Replicas = append(ci.Desired.Replicas, pi)
+		}
+	}
+	for _, peer := range rgPeers {
+		// Skip if the peer is already present.
+		if peer == id || slices.ContainsFunc(ci.Replicas, func(info *PeerInfo) bool { return info.Peer == peer }) {
+			continue
+		}
+		ci.Replicas = append(ci.Replicas, generatePeer(peer))
 	}
 	// Order the result based on the name so that we get something consistent
 	// when doing repeated stream info in the CLI, etc...
