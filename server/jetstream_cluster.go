@@ -5194,7 +5194,7 @@ func (js *jetStream) processUpdateStreamAssignment(sa *streamAssignment) {
 	sa.err = osa.err
 
 	// If we detect we are scaling down to 1, non-clustered, and we had a previous node, clear it here.
-	if sa.Config.Replicas == 1 && sa.Group.node != nil {
+	if sa.Config.Replicas == 1 && sa.Group.node != nil && sa.Group.Desired == nil {
 		sa.Group.node = nil
 	}
 
@@ -8788,33 +8788,13 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 				// This is scale up from being a singleton, set preferred to that singleton.
 				rg.Preferred = rg.Peers[0]
 			}
-			rg.ScaleUp = true
 			rg.Peers = peers
+			rg = osa.Group.withDesired(rg)
+			rg.Desired.ScaleUp = true
 		} else {
-			// We are deleting nodes here. We want to do our best to preserve the current leader.
-			// We have support now from above that guarantees we are in our own Go routine, so can
-			// ask for stream info from the stream leader to make sure we keep the leader in the new list.
-			var curLeader string
-			if !s.allPeersOffline(rg) {
-				// Need to release js lock.
-				js.mu.Unlock()
-				if si, err := sysRequest[StreamInfo](s, clusterStreamInfoT, ci.serviceAccount(), newCfg.Name); err != nil {
-					s.Warnf("Did not receive stream info results for '%s > %s' due to: %s", acc, newCfg.Name, err)
-				} else if si != nil {
-					if cl := si.Cluster; cl != nil && cl.Leader != _EMPTY_ {
-						curLeader = getHash(cl.Leader)
-					}
-				}
-				// Re-acquire here.
-				js.mu.Lock()
-			}
-			// If we identified a leader make sure its part of the new group.
-			rg.Peers = s.selectScaleDownPeers(rg.Peers, curLeader, newCfg.Replicas)
-			// Single nodes are not recorded by the NRG layer so we can rename.
-			// MUST do this, otherwise a scaleup afterward could potentially lead to inconsistencies.
-			if len(rg.Peers) == 1 {
-				rg.Name = groupNameForStream(rg.Peers, rg.Storage)
-			}
+			// Mark the group as scaling down, the current leader will be preserved.
+			rg = osa.Group.withDesired(rg)
+			rg.Desired.ScaleDown = true
 		}
 	} else if isMoveRequest {
 		if len(peerSet) == 0 {
@@ -8836,6 +8816,10 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 			rg.Preferred = peerSet[0]
 		}
 		rg.Peers = peerSet
+		rg = osa.Group.withDesired(rg)
+		rg.Desired.Rollback = &desiredRaftGroupRollback{
+			Placement: osa.Config.Placement,
+		}
 	} else {
 		// All other updates make sure no preferred is set.
 		rg.Preferred = _EMPTY_
