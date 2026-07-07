@@ -9900,26 +9900,6 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 		rBefore := nca.Config.replicas(sa.Config)
 		rAfter := cfg.replicas(sa.Config)
 
-		var curLeader string
-		if rBefore != rAfter {
-			// We are modifying nodes here. We want to do our best to preserve the current leader.
-			// We have support now from above that guarantees we are in our own Go routine, so can
-			// ask for stream info from the stream leader to make sure we keep the leader in the new list.
-			if !s.allPeersOffline(ca.Group) {
-				// Need to release js lock.
-				js.mu.Unlock()
-				if ci, err := sysRequest[ConsumerInfo](s, clusterConsumerInfoT, ci.serviceAccount(), sa.Config.Name, oname); err != nil {
-					s.Warnf("Did not receive consumer info results for '%s > %s > %s' due to: %s", acc, sa.Config.Name, oname, err)
-				} else if ci != nil {
-					if cl := ci.Cluster; cl != nil && cl.Leader != _EMPTY_ {
-						curLeader = getHash(cl.Leader)
-					}
-				}
-				// Re-acquire here.
-				js.mu.Lock()
-			}
-		}
-
 		if rBefore < rAfter {
 			newPeerSet := nca.Group.Peers
 			// Scale up by adding new members from the stream peer set that are not yet in the consumer peer set.
@@ -9952,17 +9932,12 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 				nca.Group.Name = groupNameForConsumer(newPeerSet, nca.Group.Storage)
 			}
 			nca.Group.Peers = newPeerSet
-			nca.Group.Preferred = curLeader
-			nca.Group.ScaleUp = true
+			nca.Group = ca.Group.withDesired(nca.Group)
+			nca.Group.Desired.ScaleUp = true
 		} else if rBefore > rAfter {
-			// Mark the current leader as preferred, it will be kept in the new peer set.
-			nca.Group.Preferred = curLeader
-			nca.Group.Peers = s.selectScaleDownPeers(nca.Group.Peers, curLeader, rAfter)
-			// Single nodes are not recorded by the NRG layer so we can rename.
-			// MUST do this, otherwise a scaleup afterward could potentially lead to inconsistencies.
-			if len(nca.Group.Peers) == 1 {
-				nca.Group.Name = groupNameForConsumer(nca.Group.Peers, nca.Group.Storage)
-			}
+			// Mark the group as scaling down, the current leader will be preserved.
+			nca.Group = ca.Group.withDesired(nca.Group)
+			nca.Group.Desired.ScaleDown = true
 		}
 
 		// Update config and client info on copy of existing.
