@@ -8217,32 +8217,8 @@ func (js *jetStream) remapConsumerAssignments(accName string, sa *streamAssignme
 			cfg.Replicas = r
 			cca.Config = &cfg
 		}
-		// Check if all peers are invalid. This can happen with R1 under replicated streams that are being scaled down.
-		// If the old peers are being removed we can't ask them for state, so skip the transfer.
-		if kept == 0 && !remove && !js.srv.allPeersOffline(ca.Group) {
-			// We have to transfer state to new peers.
-			// we will grab our state and attach to the new assignment.
-			// TODO(dlc) - In practice we would want to make sure the consumer is paused.
-			// Need to release js lock.
-			js.mu.Unlock()
-			if ci, err := sysRequest[ConsumerInfo](js.srv, clusterConsumerInfoT, accName, sa.Config.Name, ca.Name); err != nil {
-				js.srv.Warnf("Did not receive consumer info results for '%s > %s > %s' due to: %s", accName, sa.Config.Name, ca.Name, err)
-			} else if ci != nil {
-				cca.State = &ConsumerState{
-					Delivered: SequencePair{
-						Consumer: ci.Delivered.Consumer,
-						Stream:   ci.Delivered.Stream,
-					},
-					AckFloor: SequencePair{
-						Consumer: ci.AckFloor.Consumer,
-						Stream:   ci.AckFloor.Stream,
-					},
-				}
-			}
-			// Re-acquire here.
-			js.mu.Lock()
-		}
 		// We can not propose here before the stream itself so we collect them.
+		cca.Group = ca.Group.withDesired(cca.Group)
 		consumers = append(consumers, cca)
 	}
 	return consumers, deleted
@@ -8847,60 +8823,6 @@ func (s *Server) jsClusteredStreamRequest(ci *ClientInfo, acc *Account, subject,
 	cc.trackInflightStreamProposal(acc.Name, sa, false)
 }
 
-var (
-	errReqTimeout = errors.New("timeout while waiting for response")
-	errReqSrvExit = errors.New("server shutdown while waiting for response")
-)
-
-// blocking utility call to perform requests on the system account
-// returns (synchronized) v or error
-func sysRequest[T any](s *Server, subjFormat string, args ...any) (*T, error) {
-	isubj := fmt.Sprintf(subjFormat, args...)
-
-	s.mu.Lock()
-	if s.sys == nil {
-		s.mu.Unlock()
-		return nil, ErrNoSysAccount
-	}
-	inbox := s.newRespInbox()
-	results := make(chan *T, 1)
-	s.sys.replies[inbox] = func(_ *subscription, _ *client, _ *Account, _, _ string, msg []byte) {
-		var v T
-		if err := json.Unmarshal(msg, &v); err != nil {
-			s.Warnf("Error unmarshalling response for request '%s':%v", isubj, err)
-			return
-		}
-		select {
-		case results <- &v:
-		default:
-			s.Warnf("Failed placing request response on internal channel")
-		}
-	}
-	s.mu.Unlock()
-
-	s.sendInternalMsgLocked(isubj, inbox, nil, nil)
-
-	defer func() {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		if s.sys != nil && s.sys.replies != nil {
-			delete(s.sys.replies, inbox)
-		}
-	}()
-
-	ttl := time.NewTimer(2 * time.Second)
-	defer ttl.Stop()
-
-	select {
-	case <-s.quitCh:
-		return nil, errReqSrvExit
-	case <-ttl.C:
-		return nil, errReqTimeout
-	case data := <-results:
-		return data, nil
-	}
-}
-
 func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, subject, reply string, rmsg []byte, cfg *StreamConfig, peerSet []string, pedantic bool) {
 	js, cc := s.getJetStreamCluster()
 	if js == nil || cc == nil {
@@ -9023,34 +8945,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 
 	// Check if this is a move request, but no cancellation, and we are already moving this stream.
 	if isMoveRequest && !isMoveCancel && osa.Config.Replicas != len(rg.Peers) {
-		// obtain stats to include in error message
-		msg := _EMPTY_
-		if s.allPeersOffline(rg) {
-			msg = fmt.Sprintf("all %d peers offline", len(rg.Peers))
-		} else {
-			// Need to release js lock.
-			js.mu.Unlock()
-			if si, err := sysRequest[StreamInfo](s, clusterStreamInfoT, ci.serviceAccount(), newCfg.Name); err != nil {
-				msg = fmt.Sprintf("error retrieving info: %s", err.Error())
-			} else if si != nil {
-				currentCount := 0
-				if si.Cluster.Leader != _EMPTY_ {
-					currentCount++
-				}
-				combinedLag := uint64(0)
-				for _, r := range si.Cluster.Replicas {
-					if r.Current {
-						currentCount++
-					}
-					combinedLag += r.Lag
-				}
-				msg = fmt.Sprintf("total peers: %d, current peers: %d, combined lag: %d",
-					len(rg.Peers), currentCount, combinedLag)
-			}
-			// Re-acquire here.
-			js.mu.Lock()
-		}
-		resp.Error = NewJSStreamMoveInProgressError(msg)
+		resp.Error = NewJSStreamMoveInProgressError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
 		return
 	}
