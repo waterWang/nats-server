@@ -67,7 +67,6 @@ type RaftNode interface {
 	Group() string
 	Peers() []*Peer
 	PeerNames() []string
-	ProposeKnownPeers(knownPeers []string)
 	ProposeAddPeer(peer string) error
 	ProposeRemovePeer(peer string) error
 	MembershipChangeInProgress() bool
@@ -2182,24 +2181,6 @@ func (n *raft) Peers() []*Peer {
 		peers = append(peers, p)
 	}
 	return peers
-}
-
-// Update and propose our known set of peers.
-func (n *raft) ProposeKnownPeers(knownPeers []string) {
-	n.Lock()
-	defer n.Unlock()
-	// If we are the leader update and send this update out.
-	if n.State() != Leader {
-		return
-	}
-	n.updateKnownPeersLocked(knownPeers)
-	n.sendPeerState()
-}
-
-func (n *raft) updateKnownPeersLocked(knownPeers []string) {
-	// Process like peer state update.
-	ps := &peerState{knownPeers, len(knownPeers), n.extSt}
-	n.processPeerState(ps)
 }
 
 // ApplyQ returns the apply queue that new commits will be sent to for the
