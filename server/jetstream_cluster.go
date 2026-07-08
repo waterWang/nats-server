@@ -3719,10 +3719,7 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 				stopMigrationMonitoring()
 				continue
 			}
-			if done := js.runStreamMigration(mset, sa, n, mmLeaderID); done {
-				stopMigrationMonitoring()
-				continue
-			}
+			js.runStreamMigration(mset, sa, n, mmLeaderID)
 
 		case err := <-restoreDoneCh:
 			// We have completed a restore from snapshot on this server. The stream assignment has
@@ -3845,7 +3842,7 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 }
 
 // Migrate a stream from peer set A to peer set B. Returns true when migration is done.
-func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n RaftNode, leaderID string) bool {
+func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n RaftNode, leaderID string) {
 	ourPeerId, cc, s := n.ID(), js.cluster, js.srv
 
 	//// Check to see where we are..
@@ -3859,36 +3856,37 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 	// We are shutting down.
 	if cc == nil || cc.meta == nil {
 		js.mu.RUnlock()
-		return true
+		return
 	}
 	if sa == nil || sa.Group == nil {
 		js.mu.RUnlock()
-		return true
+		return
 	}
 	meta := cc.meta
 	accName, streamName, replicas := sa.Client.serviceAccount(), sa.Config.Name, sa.Config.Replicas
 
+	update := desiredAssignmentUpdate{Leader: leaderID}
+	sendMetaUpdate := func() {
+		reconcile := &streamAssignmentReconcile{Account: accName, Stream: streamName, desiredAssignmentUpdate: update}
+		s.sendInternalMsgLocked(streamAssignmentReconcileSubj, _EMPTY_, nil, reconcile)
+	}
+
 	// If desired state is missing, inform the meta leader to create desired state.
 	// Or, if the leader ID isn't ours, then get that updated first.
 	desired := sa.Group.Desired
+	if desired != nil {
+		update.ID = desired.ID
+	}
 	if desired == nil || desired.ID == _EMPTY_ || desired.Leader == _EMPTY_ || desired.Leader != leaderID {
-		update := &streamAssignmentReconcile{
-			Account:                 accName,
-			Stream:                  streamName,
-			desiredAssignmentUpdate: desiredAssignmentUpdate{Leader: leaderID},
-		}
-		if desired != nil {
-			update.desiredAssignmentUpdate.ID = desired.ID
-		}
 		js.mu.RUnlock()
-		s.sendInternalMsgLocked(streamAssignmentReconcileSubj, _EMPTY_, nil, update)
-		return false
+		sendMetaUpdate()
+		return
 	}
 
 	// If a membership change is in progress, we just wait for it to clear.
 	if n.MembershipChangeInProgress() {
 		js.mu.RUnlock()
-		return false
+		return
 	}
 
 	actual := n.Peers()
@@ -3907,7 +3905,7 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 		if !slices.Contains(current, peer) || !slices.Contains(metaPeers, peer) {
 			js.mu.RUnlock()
 			n.ProposeRemovePeer(peer)
-			return false
+			return
 		}
 	}
 
@@ -3916,25 +3914,16 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 		if !slices.Contains(actualPeers, peer) && slices.Contains(desiredPeers, peer) {
 			js.mu.RUnlock()
 			n.ProposeAddPeer(peer)
-			return false
+			return
 		}
 	}
 
 	// If scaling down, we need to select where to.
 	if desired.ScaleDown {
-		scaleDownPeers := s.selectScaleDownPeers(desired.Peers, ourPeerId, actual, replicas)
-		update := &streamAssignmentReconcile{
-			Account: accName,
-			Stream:  streamName,
-			desiredAssignmentUpdate: desiredAssignmentUpdate{
-				ID:             desired.ID,
-				Leader:         leaderID,
-				ScaleDownPeers: scaleDownPeers,
-			},
-		}
+		update.ScaleDownPeers = s.selectScaleDownPeers(desired.Peers, ourPeerId, actual, replicas)
 		js.mu.RUnlock()
-		s.sendInternalMsgLocked(streamAssignmentReconcileSubj, _EMPTY_, nil, update)
-		return false
+		sendMetaUpdate()
+		return
 	}
 
 	// Add peers in our desired peer set.
@@ -3952,18 +3941,10 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 				combined = append(combined, peer)
 			}
 		}
-		update := &streamAssignmentReconcile{
-			Account: accName,
-			Stream:  streamName,
-			desiredAssignmentUpdate: desiredAssignmentUpdate{
-				ID:        desired.ID,
-				Leader:    leaderID,
-				MetaPeers: combined,
-			},
-		}
+		update.MetaPeers = combined
 		js.mu.RUnlock()
-		s.sendInternalMsgLocked(streamAssignmentReconcileSubj, _EMPTY_, nil, update)
-		return false
+		sendMetaUpdate()
+		return
 	}
 
 	slices.Sort(current)
@@ -3981,7 +3962,6 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 	// If the peer sets are an exact match, we can remove a peer.
 	if len(remaining) > 0 && exactMatch {
 		// First need to check on any consumers and make sure they have moved properly before scaling down ourselves.
-		var needToWait bool
 		for name, c := range sa.consumers {
 			if c.unsupported != nil {
 				continue
@@ -3990,39 +3970,22 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 				// If we have peers still in the old set block.
 				if !slices.Contains(desiredPeers, peer) {
 					s.Debugf("Scale down of '%s > %s' blocked by consumer '%s'", sa.Client.serviceAccount(), sa.Config.Name, name)
-					needToWait = true
-					break
+					js.mu.RUnlock()
+					return
 				}
 			}
-			if needToWait {
-				break
-			}
 		}
-		if needToWait {
-			js.mu.RUnlock()
-			return false
-		}
-
 		js.mu.RUnlock()
 		n.ProposeRemovePeer(s.selectPeerToRemove(actual, remaining))
-		return false
+		return
 
 	}
 
 	// We're done.
-	update := &streamAssignmentReconcile{
-		Account: accName,
-		Stream:  streamName,
-		desiredAssignmentUpdate: desiredAssignmentUpdate{
-			ID:         desired.ID,
-			Leader:     leaderID,
-			MetaPeers:  actualPeers,
-			PeersMatch: exactMatch,
-		},
-	}
+	update.MetaPeers = actualPeers
+	update.PeersMatch = exactMatch
 	js.mu.RUnlock()
-	s.sendInternalMsgLocked(streamAssignmentReconcileSubj, _EMPTY_, nil, update)
-	return true
+	sendMetaUpdate()
 }
 
 // Determine if we are migrating
@@ -6970,10 +6933,7 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 				stopMigrationMonitoring()
 				continue
 			}
-			if done := js.runConsumerMigration(o, ca, n, mmLeaderID); done {
-				stopMigrationMonitoring()
-				continue
-			}
+			js.runConsumerMigration(ca, n, mmLeaderID)
 
 		case <-t.C:
 			// Start forcing snapshots if they failed previously.
@@ -6984,14 +6944,14 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 }
 
 // Migrate a consumer from peer set A to peer set B. Returns true when migration is done.
-func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n RaftNode, leaderID string) bool {
+func (js *jetStream) runConsumerMigration(ca *consumerAssignment, n RaftNode, leaderID string) {
 	ourPeerId, cc, s := n.ID(), js.cluster, js.srv
 
 	js.mu.RLock()
 	// We are shutting down.
 	if cc == nil || cc.meta == nil {
 		js.mu.RUnlock()
-		return true
+		return
 	}
 	meta := cc.meta
 	accName, streamName, consumerName := ca.Client.serviceAccount(), ca.Stream, ca.Name
@@ -6999,35 +6959,33 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 	osa := js.streamAssignment(accName, streamName)
 	if osa == nil {
 		js.mu.RUnlock()
-		return true
+		return
 	}
 
 	replicas := ca.Config.replicas(osa.Config)
 
+	update := desiredAssignmentUpdate{Leader: leaderID}
+	sendMetaUpdate := func() {
+		reconcile := &consumerAssignmentReconcile{Account: accName, Stream: streamName, Consumer: consumerName, desiredAssignmentUpdate: update}
+		s.sendInternalMsgLocked(consumerAssignmentReconcileSubj, _EMPTY_, nil, reconcile)
+	}
+
 	// If desired state is missing, inform the meta leader to create desired state.
 	// Or, if the leader ID isn't ours, then get that updated first.
 	desired := ca.Group.Desired
+	if desired != nil {
+		update.ID = desired.ID
+	}
 	if desired == nil || desired.ID == _EMPTY_ || desired.Leader == _EMPTY_ || desired.Leader != leaderID {
-		update := &consumerAssignmentReconcile{
-			Account:  accName,
-			Stream:   streamName,
-			Consumer: consumerName,
-			desiredAssignmentUpdate: desiredAssignmentUpdate{
-				Leader: leaderID,
-			},
-		}
-		if desired != nil {
-			update.desiredAssignmentUpdate.ID = desired.ID
-		}
 		js.mu.RUnlock()
-		s.sendInternalMsgLocked(consumerAssignmentReconcileSubj, _EMPTY_, nil, update)
-		return false
+		sendMetaUpdate()
+		return
 	}
 
 	// If a membership change is in progress, we just wait for it to clear.
 	if n.MembershipChangeInProgress() {
 		js.mu.RUnlock()
-		return false
+		return
 	}
 
 	actual := n.Peers()
@@ -7046,7 +7004,7 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 		if !slices.Contains(current, peer) || !slices.Contains(metaPeers, peer) {
 			js.mu.RUnlock()
 			n.ProposeRemovePeer(peer)
-			return false
+			return
 		}
 	}
 
@@ -7055,26 +7013,16 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 		if !slices.Contains(actualPeers, peer) && slices.Contains(desiredPeers, peer) {
 			js.mu.RUnlock()
 			n.ProposeAddPeer(peer)
-			return false
+			return
 		}
 	}
 
 	// If scaling down, we need to select where to.
 	if desired.ScaleDown {
-		scaleDownPeers := s.selectScaleDownPeers(desired.Peers, ourPeerId, actual, replicas)
-		update := &consumerAssignmentReconcile{
-			Account:  accName,
-			Stream:   streamName,
-			Consumer: consumerName,
-			desiredAssignmentUpdate: desiredAssignmentUpdate{
-				ID:             desired.ID,
-				Leader:         leaderID,
-				ScaleDownPeers: scaleDownPeers,
-			},
-		}
+		update.ScaleDownPeers = s.selectScaleDownPeers(desired.Peers, ourPeerId, actual, replicas)
 		js.mu.RUnlock()
-		s.sendInternalMsgLocked(consumerAssignmentReconcileSubj, _EMPTY_, nil, update)
-		return false
+		sendMetaUpdate()
+		return
 	}
 
 	// Add peers in our desired peer set.
@@ -7092,19 +7040,10 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 				combined = append(combined, peer)
 			}
 		}
-		update := &consumerAssignmentReconcile{
-			Account: accName,
-			Stream:  streamName,
-			Consumer: consumerName,
-			desiredAssignmentUpdate: desiredAssignmentUpdate{
-				ID:        desired.ID,
-				Leader:    leaderID,
-				MetaPeers: combined,
-			},
-		}
+		update.MetaPeers = combined
 		js.mu.RUnlock()
-		s.sendInternalMsgLocked(consumerAssignmentReconcileSubj, _EMPTY_, nil, update)
-		return false
+		sendMetaUpdate()
+		return
 	}
 
 	slices.Sort(current)
@@ -7123,25 +7062,15 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 	if len(remaining) > 0 && exactMatch {
 		js.mu.RUnlock()
 		n.ProposeRemovePeer(s.selectPeerToRemove(actual, remaining))
-		return false
+		return
 
 	}
 
 	// We're done.
-	update := &consumerAssignmentReconcile{
-		Account: accName,
-		Stream:  streamName,
-		Consumer: consumerName,
-		desiredAssignmentUpdate: desiredAssignmentUpdate{
-			ID:         desired.ID,
-			Leader:     leaderID,
-			MetaPeers:  actualPeers,
-			PeersMatch: exactMatch,
-		},
-	}
+	update.MetaPeers = actualPeers
+	update.PeersMatch = exactMatch
 	js.mu.RUnlock()
-	s.sendInternalMsgLocked(consumerAssignmentReconcileSubj, _EMPTY_, nil, update)
-	return true
+	sendMetaUpdate()
 }
 
 // Determine if we are migrating
