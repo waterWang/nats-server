@@ -3100,8 +3100,12 @@ retry:
 	}
 	// Need JS lock to be held for the assignment to avoid data-race reports
 	rg.node = n
+	preferred := rg.Preferred
+	if rg.Desired != nil {
+		preferred = rg.Desired.Preferred
+	}
 	// See if we are preferred and should start campaign immediately.
-	if n.ID() == rg.Preferred && n.Term() == 0 {
+	if n.ID() == preferred && n.Term() == 0 {
 		n.CampaignImmediately()
 	}
 	return n, nil
@@ -3862,7 +3866,7 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 		return true
 	}
 	meta := cc.meta
-	accName, streamName := sa.Client.serviceAccount(), sa.Config.Name
+	accName, streamName, replicas := sa.Client.serviceAccount(), sa.Config.Name, sa.Config.Replicas
 
 	// If desired state is missing, inform the meta leader to create desired state.
 	// Or, if the leader ID isn't ours, then get that updated first.
@@ -3888,7 +3892,11 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 	}
 
 	// TODO(mvv): continue
-	actual := n.PeerNames()
+	actual := n.Peers()
+	actualPeers := make([]string, 0, len(actual))
+	for _, p := range actual {
+		actualPeers = append(actualPeers, p.ID)
+	}
 	desiredPeers := desired.Peers
 	_, _, _, _ = ourPeerId, meta, actual, desiredPeers
 
@@ -3896,8 +3904,8 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 	// has been evicted from the cluster, e.g. by a server peer-remove. It can't take
 	// part in this migration, so remove it from the group right away rather than
 	// waiting for the rest of the migration to complete.
-	current, metaPeers := sa.Group.Peers, meta.PeerNames()
-	for _, peer := range actual {
+	current, metaPeers := copyStrings(sa.Group.Peers), meta.PeerNames()
+	for _, peer := range actualPeers {
 		if !slices.Contains(current, peer) || !slices.Contains(metaPeers, peer) {
 			js.mu.RUnlock()
 			n.ProposeRemovePeer(peer)
@@ -3905,7 +3913,33 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 		}
 	}
 
-	// Extend the meta peer set first.
+	// Extend the actual peer set through the log, but only if it's part of the desired set.
+	for _, peer := range current {
+		if !slices.Contains(actualPeers, peer) && slices.Contains(desiredPeers, peer) {
+			js.mu.RUnlock()
+			n.ProposeAddPeer(peer)
+			return false
+		}
+	}
+
+	// If scaling down, we need to select where to.
+	if desired.ScaleDown {
+		scaleDownPeers := s.selectScaleDownPeers(desired.Peers, ourPeerId, actual, replicas)
+		update := &streamAssignmentReconcile{
+			Account: accName,
+			Stream:  streamName,
+			desiredAssignmentUpdate: desiredAssignmentUpdate{
+				ID:             desired.ID,
+				Leader:         leaderID,
+				ScaleDownPeers: scaleDownPeers,
+			},
+		}
+		js.mu.RUnlock()
+		s.sendInternalMsgLocked(streamAssignmentReconcileSubj, _EMPTY_, nil, update)
+		return false
+	}
+
+	// Add peers in our desired peer set.
 	foundAll := true
 	for _, peer := range desiredPeers {
 		if !slices.Contains(current, peer) {
@@ -3934,13 +3968,47 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 		return false
 	}
 
-	// Extend the actual peer set through the log.
-	for _, peer := range current {
-		if !slices.Contains(actual, peer) {
+	slices.Sort(current)
+	slices.Sort(actualPeers)
+	exactMatch := slices.Equal(current, actualPeers)
+
+	// Remove peers not in our desired peer set.
+	var remaining []string
+	for _, peer := range actualPeers {
+		if !slices.Contains(desiredPeers, peer) {
+			remaining = append(remaining, peer)
+		}
+	}
+
+	// If the peer sets are an exact match, we can remove a peer.
+	if len(remaining) > 0 && exactMatch {
+		// First need to check on any consumers and make sure they have moved properly before scaling down ourselves.
+		var needToWait bool
+		for name, c := range sa.consumers {
+			if c.unsupported != nil {
+				continue
+			}
+			for _, peer := range c.Group.Peers {
+				// If we have peers still in the old set block.
+				if !slices.Contains(desiredPeers, peer) {
+					s.Debugf("Scale down of '%s > %s' blocked by consumer '%s'", sa.Client.serviceAccount(), sa.Config.Name, name)
+					needToWait = true
+					break
+				}
+			}
+			if needToWait {
+				break
+			}
+		}
+		if needToWait {
 			js.mu.RUnlock()
-			n.ProposeAddPeer(peer)
 			return false
 		}
+
+		js.mu.RUnlock()
+		n.ProposeRemovePeer(s.selectPeerToRemove(actual, remaining))
+		return false
+
 	}
 
 	// We're done.
@@ -3950,8 +4018,8 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 		desiredAssignmentUpdate: desiredAssignmentUpdate{
 			ID:         desired.ID,
 			Leader:     leaderID,
-			MetaPeers:  actual,
-			PeersMatch: true,
+			MetaPeers:  actualPeers,
+			PeersMatch: exactMatch,
 		},
 	}
 	js.mu.RUnlock()
@@ -9041,6 +9109,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 		syncSubject = syncSubjForStream()
 	}
 	sa := &streamAssignment{Group: rg, Sync: syncSubject, Created: osa.Created, Config: newCfg, Subject: subject, Reply: reply, Client: ci}
+	// FIXME(mvv): if the assignment already has a desired state but did not change here.. then we need to change the ID regardless
 
 	// Need to remap any consumers.
 	if isReplicaChange || isMoveRequest || isRetentionChange {
@@ -9223,7 +9292,8 @@ func (s *Server) allPeersOffline(rg *raftGroup) bool {
 // Select the peers to keep when scaling a raft group down to replicas.
 // The current leader, if known and in peer set, is kept. Online peers are preferred,
 // but we will fall back to offline peers to honor the requested replica count.
-func (s *Server) selectScaleDownPeers(peers []string, curLeader string, replicas int) []string {
+// FIXME(mvv): simplify and take lag into account
+func (s *Server) selectScaleDownPeers(peers []string, curLeader string, current []*Peer, replicas int) []string {
 	selected := make([]string, 0, replicas)
 	if curLeader != _EMPTY_ && slices.Contains(peers, curLeader) {
 		selected = append(selected, curLeader)
@@ -9231,9 +9301,22 @@ func (s *Server) selectScaleDownPeers(peers []string, curLeader string, replicas
 			return selected
 		}
 	}
+	// Prefer current peers.
+	for _, peer := range current {
+		if peer.ID == curLeader || !slices.Contains(peers, peer.ID) {
+			continue
+		}
+		selected = append(selected, peer.ID)
+		if len(selected) == replicas {
+			return selected
+		}
+	}
 	// Prefer online peers.
 	for _, peer := range peers {
 		if peer == curLeader {
+			continue
+		}
+		if slices.Contains(selected, peer) {
 			continue
 		}
 		if si, ok := s.nodeToInfo.Load(peer); ok && si != nil && !si.(nodeInfo).offline {
@@ -9255,6 +9338,75 @@ func (s *Server) selectScaleDownPeers(peers []string, curLeader string, replicas
 		}
 	}
 	return selected
+}
+
+// selectPeerToRemove picks a peer from remaining to remove during scale-down.
+// Priority order (most-likely-safe to remove first):
+//  1. offline: oldest first
+//  2. not current: online but not current (not required for quorum)
+//  3. current: online and caught up
+//
+// FIXME(mvv): simplify like above
+func (s *Server) selectPeerToRemove(current []*Peer, remaining []string) string {
+	if len(remaining) == 0 {
+		return _EMPTY_
+	}
+
+	const (
+		tierOffline       = iota // server is offline
+		tierNotCurrent           // online but raft state is behind / not caught up
+		tierOnlineCurrent        // online and caught up
+		tierUnset                // sentinel: no candidate evaluated yet
+	)
+
+	peers := make(map[string]*Peer, len(current))
+	for _, p := range current {
+		peers[p.ID] = p
+	}
+
+	now := time.Now()
+	best, bestTier := _EMPTY_, tierUnset
+	var bestLast time.Time
+
+	for _, id := range remaining {
+		rp := peers[id]
+
+		// Unknown peers are treated as offline, matching how other cluster code does it.
+		offline := true
+		if sir, ok := s.nodeToInfo.Load(id); ok && sir != nil {
+			offline = sir.(nodeInfo).offline
+		}
+
+		tier := tierOnlineCurrent
+		var last time.Time
+		switch {
+		case offline:
+			tier = tierOffline
+			if rp != nil {
+				last = rp.Last
+			}
+		case rp == nil:
+			tier = tierNotCurrent
+		default:
+			current := rp.Current
+			// Mirror clusterInfo's view: a "current" peer we haven't heard from
+			// in lostQuorumInterval is treated as not current.
+			if current && !rp.Last.IsZero() && now.Sub(rp.Last) > lostQuorumInterval {
+				current = false
+			}
+			if !current {
+				tier = tierNotCurrent
+			}
+		}
+
+		// Lower tier wins. Within tierOffline, the earlier Last wins — and
+		// time.Time's zero value is "before" any real time, so never-seen peers
+		// naturally sort ahead of peers we have heard from.
+		if tier < bestTier || (tier == tierOffline && bestTier == tierOffline && last.Before(bestLast)) {
+			best, bestTier, bestLast = id, tier, last
+		}
+	}
+	return best
 }
 
 // This will do a scatter and gather operation for all streams for this account. This is only called from metadata leader.
@@ -10142,6 +10294,8 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 		nca.Reply = reply
 		ca = nca
 	}
+
+	// FIXME(mvv): if the assignment already has a desired state but did not change here.. then we need to change the ID regardless
 
 	// Do formal proposal.
 	if err := cc.meta.Propose(cc.term, encodeAddConsumerAssignment(ca)); err != nil {
@@ -11283,7 +11437,11 @@ func (js *jetStream) clusterInfo(rg *raftGroup) *ClusterInfo {
 				Placement: d.Rollback.Placement,
 			}
 		}
-		desiredPeers = copyStrings(d.Peers)
+		// Don't populate peers if scaling down, since the peers aren't the desired set, it's
+		// the set that the group leader selects the peers to scale down to from.
+		if !d.ScaleDown {
+			desiredPeers = copyStrings(d.Peers)
+		}
 	}
 	js.mu.RUnlock()
 
