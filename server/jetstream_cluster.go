@@ -3848,12 +3848,12 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n RaftNode, leaderID string) bool {
 	ourPeerId, cc, s := n.ID(), js.cluster, js.srv
 
-	// Check to see where we are..
-	rg := mset.raftGroup()
-
-	// Make sure we have correct cluster information on the other peers.
-	ci := js.clusterInfo(rg)
-	mset.checkClusterInfo(ci)
+	//// Check to see where we are..
+	//rg := mset.raftGroup()
+	//
+	//// Make sure we have correct cluster information on the other peers.
+	//ci := js.clusterInfo(rg)
+	//mset.checkClusterInfo(ci)
 
 	js.mu.RLock()
 	// We are shutting down.
@@ -3891,14 +3891,12 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 		return false
 	}
 
-	// TODO(mvv): continue
 	actual := n.Peers()
 	actualPeers := make([]string, 0, len(actual))
 	for _, p := range actual {
 		actualPeers = append(actualPeers, p.ID)
 	}
 	desiredPeers := desired.Peers
-	_, _, _, _ = ourPeerId, meta, actual, desiredPeers
 
 	// A raft member that is not current member or no longer part of the meta group,
 	// has been evicted from the cluster, e.g. by a server peer-remove. It can't take
@@ -6855,11 +6853,13 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 	mmtd := 500 * time.Millisecond
 	var mmt *time.Ticker
 	var mmtc <-chan time.Time
+	var mmLeaderID string
 
 	startMigrationMonitoring := func() {
 		if mmt == nil {
 			mmt = time.NewTicker(mmtd)
 			mmtc = mmt.C
+			mmLeaderID = nuid.Next()
 		}
 	}
 
@@ -6970,7 +6970,7 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 				stopMigrationMonitoring()
 				continue
 			}
-			if done := js.runConsumerMigration(o, ca, n); done {
+			if done := js.runConsumerMigration(o, ca, n, mmLeaderID); done {
 				stopMigrationMonitoring()
 				continue
 			}
@@ -6984,7 +6984,7 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 }
 
 // Migrate a consumer from peer set A to peer set B. Returns true when migration is done.
-func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n RaftNode) bool {
+func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n RaftNode, leaderID string) bool {
 	ourPeerId, cc, s := n.ID(), js.cluster, js.srv
 
 	js.mu.RLock()
@@ -6995,49 +6995,153 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 	}
 	meta := cc.meta
 	accName, streamName, consumerName := ca.Client.serviceAccount(), ca.Stream, ca.Name
-	js.mu.RUnlock()
 
-	rg := o.raftGroup()
-	ci := js.clusterInfo(rg)
-	replicas, err := o.replica()
-	if err != nil {
+	osa := js.streamAssignment(accName, streamName)
+	if osa == nil {
+		js.mu.RUnlock()
 		return true
 	}
-	if len(rg.Peers) <= replicas {
-		// Migration no longer happening, so not our job anymore
-		return true
+
+	replicas := ca.Config.replicas(osa.Config)
+
+	// If desired state is missing, inform the meta leader to create desired state.
+	// Or, if the leader ID isn't ours, then get that updated first.
+	desired := ca.Group.Desired
+	if desired == nil || desired.ID == _EMPTY_ || desired.Leader == _EMPTY_ || desired.Leader != leaderID {
+		update := &consumerAssignmentReconcile{
+			Account:  accName,
+			Stream:   streamName,
+			Consumer: consumerName,
+			desiredAssignmentUpdate: desiredAssignmentUpdate{
+				Leader: leaderID,
+			},
+		}
+		if desired != nil {
+			update.desiredAssignmentUpdate.ID = desired.ID
+		}
+		js.mu.RUnlock()
+		s.sendInternalMsgLocked(consumerAssignmentReconcileSubj, _EMPTY_, nil, update)
+		return false
 	}
-	newPeers, _, newPeerSet, _ := genPeerInfo(rg.Peers, len(rg.Peers)-replicas)
 
-	// If we are part of the new peerset and we have been passed the baton.
-	// We will handle scale down.
-	if newPeerSet[ourPeerId] {
-		n.ProposeKnownPeers(newPeers)
-		cca := ca.copyGroup()
-		cca.Group.Peers = newPeers
-		cca.Group.Cluster = s.cachedClusterName()
-		meta.ForwardProposal(encodeAddConsumerAssignment(cca))
-		s.Noticef("Scaling down '%s > %s > %s' to %+v", accName, streamName, consumerName, s.peerSetToNames(newPeers))
+	// If a membership change is in progress, we just wait for it to clear.
+	if n.MembershipChangeInProgress() {
+		js.mu.RUnlock()
+		return false
+	}
 
-	} else {
-		var newLeaderPeer, newLeader, newCluster string
-		neededCurrent, current := replicas/2+1, 0
-		for _, r := range ci.Replicas {
-			if r.Current && newPeerSet[r.Peer] {
-				current++
-				if newCluster == _EMPTY_ {
-					newLeaderPeer, newLeader, newCluster = r.Peer, r.Name, r.cluster
-				}
+	actual := n.Peers()
+	actualPeers := make([]string, 0, len(actual))
+	for _, p := range actual {
+		actualPeers = append(actualPeers, p.ID)
+	}
+	desiredPeers := desired.Peers
+
+	// A raft member that is not current member or no longer part of the meta group,
+	// has been evicted from the cluster, e.g. by a server peer-remove. It can't take
+	// part in this migration, so remove it from the group right away rather than
+	// waiting for the rest of the migration to complete.
+	current, metaPeers := copyStrings(ca.Group.Peers), meta.PeerNames()
+	for _, peer := range actualPeers {
+		if !slices.Contains(current, peer) || !slices.Contains(metaPeers, peer) {
+			js.mu.RUnlock()
+			n.ProposeRemovePeer(peer)
+			return false
+		}
+	}
+
+	// Extend the actual peer set through the log, but only if it's part of the desired set.
+	for _, peer := range current {
+		if !slices.Contains(actualPeers, peer) && slices.Contains(desiredPeers, peer) {
+			js.mu.RUnlock()
+			n.ProposeAddPeer(peer)
+			return false
+		}
+	}
+
+	// If scaling down, we need to select where to.
+	if desired.ScaleDown {
+		scaleDownPeers := s.selectScaleDownPeers(desired.Peers, ourPeerId, actual, replicas)
+		update := &consumerAssignmentReconcile{
+			Account:  accName,
+			Stream:   streamName,
+			Consumer: consumerName,
+			desiredAssignmentUpdate: desiredAssignmentUpdate{
+				ID:             desired.ID,
+				Leader:         leaderID,
+				ScaleDownPeers: scaleDownPeers,
+			},
+		}
+		js.mu.RUnlock()
+		s.sendInternalMsgLocked(consumerAssignmentReconcileSubj, _EMPTY_, nil, update)
+		return false
+	}
+
+	// Add peers in our desired peer set.
+	foundAll := true
+	for _, peer := range desiredPeers {
+		if !slices.Contains(current, peer) {
+			foundAll = false
+			break
+		}
+	}
+	if !foundAll {
+		combined := current
+		for _, peer := range desiredPeers {
+			if !slices.Contains(current, peer) {
+				combined = append(combined, peer)
 			}
 		}
+		update := &consumerAssignmentReconcile{
+			Account: accName,
+			Stream:  streamName,
+			Consumer: consumerName,
+			desiredAssignmentUpdate: desiredAssignmentUpdate{
+				ID:        desired.ID,
+				Leader:    leaderID,
+				MetaPeers: combined,
+			},
+		}
+		js.mu.RUnlock()
+		s.sendInternalMsgLocked(consumerAssignmentReconcileSubj, _EMPTY_, nil, update)
+		return false
+	}
 
-		// Check if we have a quorom
-		if current >= neededCurrent {
-			s.Noticef("Transfer of consumer leader for '%s > %s > %s' to '%s'", accName, streamName, consumerName, newLeader)
-			n.StepDown(newLeaderPeer)
+	slices.Sort(current)
+	slices.Sort(actualPeers)
+	exactMatch := slices.Equal(current, actualPeers)
+
+	// Remove peers not in our desired peer set.
+	var remaining []string
+	for _, peer := range actualPeers {
+		if !slices.Contains(desiredPeers, peer) {
+			remaining = append(remaining, peer)
 		}
 	}
-	return false
+
+	// If the peer sets are an exact match, we can remove a peer.
+	if len(remaining) > 0 && exactMatch {
+		js.mu.RUnlock()
+		n.ProposeRemovePeer(s.selectPeerToRemove(actual, remaining))
+		return false
+
+	}
+
+	// We're done.
+	update := &consumerAssignmentReconcile{
+		Account: accName,
+		Stream:  streamName,
+		Consumer: consumerName,
+		desiredAssignmentUpdate: desiredAssignmentUpdate{
+			ID:         desired.ID,
+			Leader:     leaderID,
+			MetaPeers:  actualPeers,
+			PeersMatch: exactMatch,
+		},
+	}
+	js.mu.RUnlock()
+	s.sendInternalMsgLocked(consumerAssignmentReconcileSubj, _EMPTY_, nil, update)
+	return true
 }
 
 // Determine if we are migrating
