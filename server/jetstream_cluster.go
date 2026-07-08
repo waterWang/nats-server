@@ -3074,7 +3074,7 @@ retry:
 			store = ms
 		}
 
-		cfg := &RaftConfig{Name: rgName, Store: storeDir, Log: store, Track: true, Recovering: recovering, ScaleUp: rgScaleUp}
+		cfg := &RaftConfig{Name: rgName, Store: storeDir, Log: store, Track: true, Managed: true, Recovering: recovering, ScaleUp: rgScaleUp}
 
 		if _, err := readPeerState(s.diskIOSemaphore(), storeDir); err != nil {
 			s.bootstrapRaftNode(cfg, rgPeers, true)
@@ -3411,8 +3411,8 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 		if mmt == nil {
 			mmt = time.NewTicker(mmtd)
 			mmtc = mmt.C
+			mmLeaderID = nuid.Next()
 		}
-		mmLeaderID = nuid.Next()
 	}
 
 	stopMigrationMonitoring := func() {
@@ -3865,11 +3865,16 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 	accName, streamName := sa.Client.serviceAccount(), sa.Config.Name
 
 	// If desired state is missing, inform the meta leader to create desired state.
-	if sa.Group.Desired == nil {
+	// Or, if the leader ID isn't ours, then get that updated first.
+	desired := sa.Group.Desired
+	if desired == nil || desired.ID == _EMPTY_ || desired.Leader == _EMPTY_ || desired.Leader != leaderID {
 		update := &streamAssignmentReconcile{
 			Account:                 accName,
 			Stream:                  streamName,
 			desiredAssignmentUpdate: desiredAssignmentUpdate{Leader: leaderID},
+		}
+		if desired != nil {
+			update.desiredAssignmentUpdate.ID = desired.ID
 		}
 		js.mu.RUnlock()
 		s.sendInternalMsgLocked(streamAssignmentReconcileSubj, _EMPTY_, nil, update)
@@ -3884,11 +3889,74 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 
 	// TODO(mvv): continue
 	actual := n.PeerNames()
-	desired := sa.Group.Desired.Peers
-	_, _, _, _ = ourPeerId, meta, actual, desired
+	desiredPeers := desired.Peers
+	_, _, _, _ = ourPeerId, meta, actual, desiredPeers
 
+	// A raft member that is not current member or no longer part of the meta group,
+	// has been evicted from the cluster, e.g. by a server peer-remove. It can't take
+	// part in this migration, so remove it from the group right away rather than
+	// waiting for the rest of the migration to complete.
+	current, metaPeers := sa.Group.Peers, meta.PeerNames()
+	for _, peer := range actual {
+		if !slices.Contains(current, peer) || !slices.Contains(metaPeers, peer) {
+			js.mu.RUnlock()
+			n.ProposeRemovePeer(peer)
+			return false
+		}
+	}
+
+	// Extend the meta peer set first.
+	foundAll := true
+	for _, peer := range desiredPeers {
+		if !slices.Contains(current, peer) {
+			foundAll = false
+			break
+		}
+	}
+	if !foundAll {
+		combined := current
+		for _, peer := range desiredPeers {
+			if !slices.Contains(current, peer) {
+				combined = append(combined, peer)
+			}
+		}
+		update := &streamAssignmentReconcile{
+			Account: accName,
+			Stream:  streamName,
+			desiredAssignmentUpdate: desiredAssignmentUpdate{
+				ID:        desired.ID,
+				Leader:    leaderID,
+				MetaPeers: combined,
+			},
+		}
+		js.mu.RUnlock()
+		s.sendInternalMsgLocked(streamAssignmentReconcileSubj, _EMPTY_, nil, update)
+		return false
+	}
+
+	// Extend the actual peer set through the log.
+	for _, peer := range current {
+		if !slices.Contains(actual, peer) {
+			js.mu.RUnlock()
+			n.ProposeAddPeer(peer)
+			return false
+		}
+	}
+
+	// We're done.
+	update := &streamAssignmentReconcile{
+		Account: accName,
+		Stream:  streamName,
+		desiredAssignmentUpdate: desiredAssignmentUpdate{
+			ID:         desired.ID,
+			Leader:     leaderID,
+			MetaPeers:  actual,
+			PeersMatch: true,
+		},
+	}
 	js.mu.RUnlock()
-	return false
+	s.sendInternalMsgLocked(streamAssignmentReconcileSubj, _EMPTY_, nil, update)
+	return true
 }
 
 // Determine if we are migrating
@@ -7590,12 +7658,14 @@ type consumerAssignmentReconcile struct {
 }
 
 type desiredAssignmentUpdate struct {
-	Leader string `json:"leader"`       // Leader consistency ID.
 	ID     string `json:"id,omitempty"` // Desired state ID. Empty if there is no desired state yet.
+	Leader string `json:"leader"`       // Leader consistency ID.
 
 	// The below fields are mutually exclusive.
 	ScaleDownPeers []string `json:"scale_down_peers,omitempty"` // If the desired state was about scaledown, this is the selected peer set.
-	ActualPeers    []string `json:"actual_peers,omitempty"`     // Actual peer set should be updated.
+	MetaPeers      []string `json:"meta_peers,omitempty"`       // Which peers the assignment should be updated to.
+
+	PeersMatch bool `json:"match,omitempty"` // Actual peer set matches with the passed MetaPeers.
 }
 
 // reconcileDesiredStreamAssignment runs on the meta leader and reconciles a stream's assignment.
@@ -7604,10 +7674,6 @@ func (js *jetStream) reconcileDesiredStreamAssignment(_ *subscription, _ *client
 	decoder := json.NewDecoder(bytes.NewReader(msg))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&reconcile); err != nil {
-		return
-	}
-	// Fields are mutually exclusive.
-	if reconcile.ScaleDownPeers != nil && reconcile.ActualPeers != nil {
 		return
 	}
 
@@ -7622,7 +7688,7 @@ func (js *jetStream) reconcileDesiredStreamAssignment(_ *subscription, _ *client
 	if osa == nil || osa.Group == nil || osa.unsupported != nil || reconcile.Leader == _EMPTY_ {
 		return
 	}
-	ng := osa.Group.reconcileDesiredGroup(reconcile.desiredAssignmentUpdate, osa.Config.Replicas)
+	ng := osa.Group.reconcileDesiredState(reconcile.desiredAssignmentUpdate, osa.Config.Replicas)
 	if ng == nil {
 		return
 	}
@@ -7642,10 +7708,6 @@ func (js *jetStream) reconcileDesiredConsumerAssignment(_ *subscription, _ *clie
 	if err := decoder.Decode(&reconcile); err != nil {
 		return
 	}
-	// Fields are mutually exclusive.
-	if reconcile.ScaleDownPeers != nil && reconcile.ActualPeers != nil {
-		return
-	}
 
 	js.mu.Lock()
 	defer js.mu.Unlock()
@@ -7659,7 +7721,7 @@ func (js *jetStream) reconcileDesiredConsumerAssignment(_ *subscription, _ *clie
 	if oca == nil || oca.Group == nil || oca.unsupported != nil || reconcile.Leader == _EMPTY_ {
 		return
 	}
-	ng := oca.Group.reconcileDesiredGroup(reconcile.desiredAssignmentUpdate, oca.Config.Replicas)
+	ng := oca.Group.reconcileDesiredState(reconcile.desiredAssignmentUpdate, oca.Config.Replicas)
 	if ng == nil {
 		return
 	}
@@ -7671,7 +7733,12 @@ func (js *jetStream) reconcileDesiredConsumerAssignment(_ *subscription, _ *clie
 	cc.trackInflightConsumerProposal(reconcile.Account, reconcile.Stream, ca, false)
 }
 
-func (rg *raftGroup) reconcileDesiredGroup(reconcile desiredAssignmentUpdate, replicas int) *raftGroup {
+func (rg *raftGroup) reconcileDesiredState(reconcile desiredAssignmentUpdate, replicas int) *raftGroup {
+	// Fields are mutually exclusive.
+	if reconcile.ScaleDownPeers != nil && reconcile.MetaPeers != nil {
+		return nil
+	}
+
 	// Initialize desired state if not set.
 	// FIXME(mvv): test with pre-existing move state without desired.
 	if rg.Desired == nil {
@@ -7722,19 +7789,19 @@ func (rg *raftGroup) reconcileDesiredGroup(reconcile desiredAssignmentUpdate, re
 		return ng
 	}
 
-	// Final check to make sure it's about an actual peer set update.
-	if reconcile.ActualPeers == nil {
+	// Final check to make sure it's about a meta assignment peer set update.
+	if reconcile.MetaPeers == nil {
 		return nil
 	}
 
 	// Always update the actual peers.
 	ng := rg.copyGroup()
-	ng.Peers = reconcile.ActualPeers
+	ng.Peers = reconcile.MetaPeers
 
 	desiredPeers := copyStrings(rg.Desired.Peers)
 	slices.Sort(desiredPeers)
-	slices.Sort(reconcile.ActualPeers)
-	if exactMatch := slices.Equal(desiredPeers, reconcile.ActualPeers); exactMatch {
+	slices.Sort(reconcile.MetaPeers)
+	if exactMatch := slices.Equal(desiredPeers, reconcile.MetaPeers); exactMatch && reconcile.PeersMatch {
 		// We're done, reset the desired state fields and finalize the assignment.
 		ng.Cluster = rg.Desired.Cluster
 		ng.Preferred = _EMPTY_
