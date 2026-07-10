@@ -3406,7 +3406,7 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 	restoreDoneCh := make(<-chan error)
 
 	// For migration tracking.
-	mmtd := 500 * time.Millisecond
+	mmtd := 300 * time.Millisecond
 	var mmt *time.Ticker
 	var mmtc <-chan time.Time
 	var mmLeaderID string
@@ -3939,6 +3939,8 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 		for _, peer := range desiredPeers {
 			if !slices.Contains(current, peer) {
 				combined = append(combined, peer)
+				// TODO(mvv): for testing only add one replica per cycle.
+				break
 			}
 		}
 		update.MetaPeers = combined
@@ -6815,7 +6817,7 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 	}
 
 	// For migration tracking.
-	mmtd := 500 * time.Millisecond
+	mmtd := 300 * time.Millisecond
 	var mmt *time.Ticker
 	var mmtc <-chan time.Time
 	var mmLeaderID string
@@ -7046,6 +7048,8 @@ func (js *jetStream) runConsumerMigration(ca *consumerAssignment, n RaftNode, le
 		for _, peer := range desiredPeers {
 			if !slices.Contains(current, peer) {
 				combined = append(combined, peer)
+				// TODO(mvv): for testing only add one replica per cycle.
+				break
 			}
 		}
 		update.MetaPeers = combined
