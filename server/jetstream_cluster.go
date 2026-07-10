@@ -8968,23 +8968,48 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 	// Check for replica changes.
 	isReplicaChange := newCfg.Replicas != osa.Config.Replicas
 
-	// Check if this is a move request, but no cancellation, and we are already moving this stream.
-	if isMoveRequest && !isMoveCancel && osa.Config.Replicas != len(rg.Peers) {
-		resp.Error = NewJSStreamMoveInProgressError()
-		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
-		return
-	}
+	// FIXME(mvv): should move be prevented if already ongoing? maybe accept but with group size limits?
+	_ = isMoveCancel
+	//// Check if this is a move request, but no cancellation, and we are already moving this stream.
+	//if isMoveRequest && !isMoveCancel && osa.Config.Replicas != len(rg.Peers) {
+	//	resp.Error = NewJSStreamMoveInProgressError()
+	//	s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
+	//	return
+	//}
 
-	// Can not move and scale at same time.
-	if isMoveRequest && isReplicaChange {
-		resp.Error = NewJSStreamMoveAndScaleError()
-		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
-		return
-	}
+	// FIXME(mvv): can now move and scale at the same time
+	//// Can not move and scale at same time.
+	//if isMoveRequest && isReplicaChange {
+	//	resp.Error = NewJSStreamMoveAndScaleError()
+	//	s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
+	//	return
+	//}
 
 	// Reset notion of scaling up, if this was done in a previous update.
 	rg.ScaleUp = false
-	if isReplicaChange {
+	if isMoveRequest {
+		if len(peerSet) == 0 {
+			nrg, err := js.createGroupForStream(ci, newCfg)
+			if err != nil {
+				resp.Error = NewJSClusterNoPeersError(err)
+				s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
+				return
+			}
+			// Overwrite to the new group, but MUST keep the same group name.
+			name := rg.Name
+			rg = nrg
+			rg.Name = name
+		} else {
+			if len(rg.Peers) == 1 {
+				rg.Preferred = peerSet[0]
+			}
+			rg.Peers = peerSet
+		}
+		rg = osa.Group.withDesired(rg)
+		rg.Desired.Rollback = &desiredRaftGroupRollback{
+			Placement: osa.Config.Placement,
+		}
+	} else if isReplicaChange {
 		currentPeers := rg.Peers
 		if osa.Group.Desired != nil {
 			currentPeers = osa.Group.Desired.Peers
@@ -9032,28 +9057,6 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 			rg.Peers = currentPeers
 			rg = osa.Group.withDesired(rg)
 			rg.Desired.ScaleDown = true
-		}
-	} else if isMoveRequest {
-		if len(peerSet) == 0 {
-			nrg, err := js.createGroupForStream(ci, newCfg)
-			if err != nil {
-				resp.Error = NewJSClusterNoPeersError(err)
-				s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
-				return
-			}
-			// Overwrite to the new group, but MUST keep the same group name.
-			name := rg.Name
-			rg = nrg
-			rg.Name = name
-		} else {
-			if len(rg.Peers) == 1 {
-				rg.Preferred = peerSet[0]
-			}
-			rg.Peers = peerSet
-		}
-		rg = osa.Group.withDesired(rg)
-		rg.Desired.Rollback = &desiredRaftGroupRollback{
-			Placement: osa.Config.Placement,
 		}
 	} else {
 		// All other updates make sure no preferred is set.
