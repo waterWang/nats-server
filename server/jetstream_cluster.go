@@ -7006,6 +7006,7 @@ func (js *jetStream) runConsumerMigration(ca *consumerAssignment, n RaftNode, le
 		if !slices.Contains(current, peer) || !slices.Contains(metaPeers, peer) {
 			js.mu.RUnlock()
 			// Step down and perform a leader transfer if we'd remove ourselves.
+			// FIXME(mvv): also do this for stream, and should select a peer in the other set (or remove leader last)
 			if peer == ourPeerId {
 				n.StepDown()
 			} else {
@@ -8984,7 +8985,11 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 	// Reset notion of scaling up, if this was done in a previous update.
 	rg.ScaleUp = false
 	if isReplicaChange {
-		isScaleUp := newCfg.Replicas > len(rg.Peers)
+		currentPeers := rg.Peers
+		if osa.Group.Desired != nil {
+			currentPeers = osa.Group.Desired.Peers
+		}
+		isScaleUp := newCfg.Replicas > len(currentPeers)
 		// We are adding new peers here.
 		if isScaleUp {
 			// Check that we have the allocation available.
@@ -9005,7 +9010,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 					rg.Cluster = ci.Cluster
 				}
 			}
-			peers, err := cc.selectPeerGroup(newCfg.Replicas, rg.Cluster, newCfg, rg.Peers, 0, nil)
+			peers, err := cc.selectPeerGroup(newCfg.Replicas, rg.Cluster, newCfg, currentPeers, 0, nil)
 			if err != nil {
 				resp.Error = NewJSClusterNoPeersError(err)
 				s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
@@ -9015,15 +9020,16 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 			if len(peers) == 1 || osa.Config.Replicas == 1 {
 				rg.Name = groupNameForStream(peers, rg.Storage)
 			}
-			if len(rg.Peers) == 1 {
+			if len(currentPeers) == 1 {
 				// This is scale up from being a singleton, set preferred to that singleton.
-				rg.Preferred = rg.Peers[0]
+				rg.Preferred = currentPeers[0]
 			}
 			rg.Peers = peers
 			rg = osa.Group.withDesired(rg)
 			rg.Desired.ScaleUp = true
 		} else {
 			// Mark the group as scaling down, the current leader will be preserved.
+			rg.Peers = currentPeers
 			rg = osa.Group.withDesired(rg)
 			rg.Desired.ScaleDown = true
 		}
