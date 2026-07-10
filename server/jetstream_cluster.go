@@ -9035,18 +9035,16 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 				s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
 				return
 			}
-			// filter peers present in both sets
-			for _, peer := range rg.Peers {
-				if !slices.Contains(nrg.Peers, peer) {
-					peerSet = append(peerSet, peer)
-				}
+			// Overwrite to the new group, but MUST keep the same group name.
+			name := rg.Name
+			rg = nrg
+			rg.Name = name
+		} else {
+			if len(rg.Peers) == 1 {
+				rg.Preferred = peerSet[0]
 			}
-			peerSet = append(peerSet, nrg.Peers...)
+			rg.Peers = peerSet
 		}
-		if len(rg.Peers) == 1 {
-			rg.Preferred = peerSet[0]
-		}
-		rg.Peers = peerSet
 		rg = osa.Group.withDesired(rg)
 		rg.Desired.Rollback = &desiredRaftGroupRollback{
 			Placement: osa.Config.Placement,
