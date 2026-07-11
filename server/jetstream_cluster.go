@@ -7044,15 +7044,25 @@ func (js *jetStream) runConsumerMigration(ca *consumerAssignment, n RaftNode, le
 		}
 	}
 	if !foundAll {
-		combined := current
+		// Only add a peer once the stream is actually hosted on it. A consumer can't
+		// move to a peer earlier until the stream is hosted there.
+		var nextPeer string
 		for _, peer := range desiredPeers {
-			if !slices.Contains(current, peer) {
-				combined = append(combined, peer)
-				// TODO(mvv): for testing only add one replica per cycle.
-				break
+			if slices.Contains(current, peer) {
+				continue
 			}
+			if !slices.Contains(osa.Group.Peers, peer) {
+				continue
+			}
+			nextPeer = peer
+			break
 		}
-		update.MetaPeers = combined
+		if nextPeer == _EMPTY_ {
+			js.mu.RUnlock()
+			return
+		}
+		// TODO(mvv): for testing only add one replica per cycle.
+		update.MetaPeers = append(current, nextPeer)
 		js.mu.RUnlock()
 		sendMetaUpdate()
 		return
@@ -7859,6 +7869,23 @@ func (js *jetStream) reconcileDesiredConsumerAssignment(_ *subscription, _ *clie
 	oca := js.consumerAssignmentOrInflight(reconcile.Account, reconcile.Stream, reconcile.Consumer)
 	if oca == nil || oca.Group == nil || oca.unsupported != nil || reconcile.Leader == _EMPTY_ {
 		return
+	}
+	// Sanity check that the consumer isn't trying to scale to a peer that isn't
+	// in the stream's peer assignment yet. Otherwise, we'd add a consumer peer where
+	// a stream isn't hosted yet.
+	if len(reconcile.MetaPeers) > 0 {
+		osa := js.streamAssignmentOrInflight(reconcile.Account, reconcile.Stream)
+		if osa == nil || osa.Group == nil {
+			return
+		}
+		for _, peer := range reconcile.MetaPeers {
+			if slices.Contains(oca.Group.Peers, peer) {
+				continue
+			}
+			if !slices.Contains(osa.Group.Peers, peer) {
+				return
+			}
+		}
 	}
 	ng := oca.Group.reconcileDesiredState(reconcile.desiredAssignmentUpdate, oca.Config.Replicas, true)
 	if ng == nil {
