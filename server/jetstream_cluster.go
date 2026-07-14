@@ -9133,7 +9133,12 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 			if rg.Desired.Origin == nil {
 				rg.Desired.Origin = &desiredRaftGroupOrigin{}
 			}
-			rg.Desired.Origin.Retention = &osa.Config.Retention
+			if d := osa.Group.Desired; d != nil && d.Origin != nil && d.Origin.Retention != nil {
+				// Preserve the previous origin's retention, as we'd otherwise clobber it.
+				rg.Desired.Origin.Retention = d.Origin.Retention
+			} else {
+				rg.Desired.Origin.Retention = &osa.Config.Retention
+			}
 		}
 	}
 
