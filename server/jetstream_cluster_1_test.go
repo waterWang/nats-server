@@ -13574,6 +13574,169 @@ func TestJetStreamClusterConsumerScaleOnRetentionChange(t *testing.T) {
 	updateRetentionAndCheck(nats.InterestPolicy, 3)
 }
 
+func TestJetStreamClusterRetentionChangeWaitsForConsumerParity(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	// Limits retention at R3, so the legacy ephemeral starts out at R1.
+	cfg := &nats.StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo"},
+		Retention: nats.LimitsPolicy,
+		Replicas:  3,
+	}
+	_, err := js.AddStream(cfg)
+	require_NoError(t, err)
+
+	ci, err := js.AddConsumer("TEST", &nats.ConsumerConfig{
+		AckPolicy:         nats.AckExplicitPolicy,
+		InactiveThreshold: time.Minute,
+	})
+	require_NoError(t, err)
+	cname := ci.Name
+	require_NotEqual(t, cname, _EMPTY_)
+
+	// How many peers the consumer is assigned to, according to the meta leader.
+	consumerPeers := func() int {
+		ml := c.leader()
+		if ml == nil {
+			return 0
+		}
+		mjs := ml.getJetStream()
+		mjs.mu.RLock()
+		defer mjs.mu.RUnlock()
+		ca := mjs.consumerAssignment(globalAccountName, "TEST", cname)
+		if ca == nil || ca.Group == nil {
+			return 0
+		}
+		return len(ca.Group.Peers)
+	}
+	require_Equal(t, consumerPeers(), 1)
+
+	cfg.Retention = nats.InterestPolicy
+	_, err = js.UpdateStream(cfg)
+	require_NoError(t, err)
+
+	// The consumer must reach peer parity with the stream BEFORE any server starts applying interest
+	// retention. A stream peer that runs interest retention without hosting a consumer replica would
+	// compute interest over an incomplete consumer set and remove messages that are still of interest.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		interest := 0
+		for _, s := range c.servers {
+			mset, err := s.globalAccount().lookupStream("TEST")
+			if err != nil || mset == nil || !mset.isInterestRetention() {
+				continue
+			}
+			interest++
+			// Re-read here, the consumer could have converged in the meantime.
+			if peers := consumerPeers(); peers < 3 {
+				t.Fatalf("Server %q applied interest retention while consumer was only on %d peer(s)", s.Name(), peers)
+			}
+		}
+		if interest == len(c.servers) && consumerPeers() == 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Timed out with %d/%d servers on interest retention and consumer on %d peer(s)",
+				interest, len(c.servers), consumerPeers())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func TestJetStreamClusterRetentionChangeOriginSurvivesScale(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R5S", 5)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	cfg := &nats.StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo"},
+		Retention: nats.LimitsPolicy,
+		Replicas:  3,
+	}
+	_, err := js.AddStream(cfg)
+	require_NoError(t, err)
+
+	// Legacy ephemeral, presents as R=0 and sits at R1 under limits retention.
+	ci, err := js.AddConsumer("TEST", &nats.ConsumerConfig{
+		AckPolicy:         nats.AckExplicitPolicy,
+		InactiveThreshold: time.Minute,
+	})
+	require_NoError(t, err)
+	cname := ci.Name
+	require_NotEqual(t, cname, _EMPTY_)
+
+	// The peers assigned to the stream and to the consumer, according to the meta leader.
+	assignedPeers := func() (speers, cpeers []string) {
+		ml := c.leader()
+		if ml == nil {
+			return nil, nil
+		}
+		mjs := ml.getJetStream()
+		mjs.mu.RLock()
+		defer mjs.mu.RUnlock()
+		if sa := mjs.streamAssignment(globalAccountName, "TEST"); sa != nil && sa.Group != nil {
+			speers = sa.Group.Peers
+		}
+		if ca := mjs.consumerAssignment(globalAccountName, "TEST", cname); ca != nil && ca.Group != nil {
+			cpeers = ca.Group.Peers
+		}
+		return speers, cpeers
+	}
+	speers, cpeers := assignedPeers()
+	require_Equal(t, len(speers), 3)
+	require_Equal(t, len(cpeers), 1)
+
+	// Switch to interest retention. The consumer needs to reach peer parity before it can apply,
+	// so the old retention is held in the desired state's origin while the consumer scales up.
+	cfg.Retention = nats.InterestPolicy
+	_, err = js.UpdateStream(cfg)
+	require_NoError(t, err)
+
+	// While that is still converging, scale the stream. This re-registers the desired state and
+	// MUST NOT drop the pending retention origin, otherwise interest retention applies right away.
+	cfg.Replicas = 5
+	_, err = js.UpdateStream(cfg)
+	require_NoError(t, err)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		interest := 0
+		for _, s := range c.servers {
+			mset, err := s.GlobalAccount().lookupStream("TEST")
+			if err != nil || mset == nil || !mset.isInterestRetention() {
+				continue
+			}
+			interest++
+			// Every stream peer must host a consumer replica before interest retention applies.
+			// Re-read here, the consumer could have converged in the meantime.
+			speers, cpeers := assignedPeers()
+			for _, p := range speers {
+				if !slices.Contains(cpeers, p) {
+					t.Fatalf("Server %q applied interest retention, but stream peer %q hosts no consumer replica (stream peers %v, consumer peers %v)",
+						s.Name(), p, speers, cpeers)
+				}
+			}
+		}
+		speers, cpeers = assignedPeers()
+		if interest == len(c.servers) && len(speers) == 5 && len(cpeers) == 5 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Timed out with %d/%d servers on interest retention, stream peers %v, consumer peers %v",
+				interest, len(c.servers), speers, cpeers)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 func TestJetStreamClusterStreamPeerRemoveConsumerRemap(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R5S", 5)
 	defer c.shutdown()
