@@ -7287,7 +7287,9 @@ func TestJetStreamClusterStreamResetWithLargeFirstSeq(t *testing.T) {
 	cfg.Replicas = 3
 	_, err = js.UpdateStream(cfg)
 	require_NoError(t, err)
+	c.waitOnStreamLeader("$G", "TEST")
 	nl := c.randomNonStreamLeader("$G", "TEST")
+	require_NotNil(t, nl)
 	c.waitOnStreamCurrent(nl, "$G", "TEST")
 
 	// Make sure we only sent the number of catchup msgs we expected.

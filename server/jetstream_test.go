@@ -16529,6 +16529,7 @@ func TestJetStreamLimitsToInterestPolicyWhileAcking(t *testing.T) {
 
 			// We need to wait for all nodes to have applied the new stream
 			// configuration.
+			c.waitOnStreamLeader(globalAccountName, "TEST")
 			c.waitOnAllCurrent()
 
 			var retention nats.RetentionPolicy

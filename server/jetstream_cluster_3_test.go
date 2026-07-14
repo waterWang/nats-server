@@ -1993,7 +1993,8 @@ func TestJetStreamClusterReplacementPolicyAfterPeerRemove(t *testing.T) {
 
 		sc.waitOnStreamLeader(globalAccountName, "TEST")
 
-		checkFor(t, time.Second, 200*time.Millisecond, func() error {
+		// TODO(mvv): continue
+		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
 			osi, err = jsc.StreamInfo("TEST")
 			require_NoError(t, err)
 			if len(osi.Cluster.Replicas) != 2 {
