@@ -187,12 +187,14 @@ type desiredRaftGroup struct {
 	ScaleUp   bool `json:"scale_up,omitempty"`
 	ScaleDown bool `json:"scale_down,omitempty"`
 
-	// A move can be canceled if a rollback is specified.
-	Rollback *desiredRaftGroupRollback `json:"rollback,omitempty"`
+	Origin *desiredRaftGroupOrigin `json:"origin,omitempty"`
 }
 
-type desiredRaftGroupRollback struct {
+type desiredRaftGroupOrigin struct {
+	// A move can be canceled to move back to the original placement if specified.
 	Placement *Placement `json:"placement,omitempty"`
+	// When changing between retention policies, this retention remains active until unset.
+	Retention *RetentionPolicy `json:"retention,omitempty"`
 }
 
 // withDesired returns a copy of rg with target expressed as the desired state.
@@ -219,6 +221,21 @@ func (rg *raftGroup) withDesired(target *raftGroup) *raftGroup {
 		Preferred: target.Preferred,
 	}
 	return ng
+}
+
+// atDesiredOrigin returns a copy of the config with the desired origin applied (if any).
+func (cfg *StreamConfig) atDesiredOrigin(rg *raftGroup) *StreamConfig {
+	if rg.Desired == nil || rg.Desired.Origin == nil {
+		return cfg
+	}
+	newCfg := cfg.clone()
+	if rg.Desired.Origin.Placement != nil {
+		newCfg.Placement = rg.Desired.Origin.Placement
+	}
+	if rg.Desired.Origin.Retention != nil {
+		newCfg.Retention = *rg.Desired.Origin.Retention
+	}
+	return newCfg
 }
 
 // streamAssignment is what the meta controller uses to assign streams to peers.
@@ -2581,9 +2598,9 @@ func (rg *raftGroup) copyGroup() *raftGroup {
 	if rg.Desired != nil {
 		cd := *rg.Desired
 		cd.Peers = copyStrings(rg.Desired.Peers)
-		if rg.Desired.Rollback != nil {
-			cr := *rg.Desired.Rollback
-			cd.Rollback = &cr
+		if rg.Desired.Origin != nil {
+			cr := *rg.Desired.Origin
+			cd.Origin = &cr
 		}
 		cg.Desired = &cd
 	}
@@ -2631,7 +2648,7 @@ func (js *jetStream) processAddPeer(peer string) {
 			csa := sa.copyGroup()
 			csa.Group.Peers = append(csa.Group.Peers, peer)
 			// Send our proposal for this csa. Also use same group definition for all the consumers as well.
-			consumers, _ := js.remapConsumerAssignments(accName, csa, false)
+			consumers, _, _ := js.remapConsumerAssignments(accName, csa, false)
 			if err := cc.meta.Propose(cc.term, encodeAddStreamAssignment(csa)); err != nil {
 				return
 			}
@@ -2723,7 +2740,7 @@ func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer strin
 	}
 
 	// Send our proposal for this csa. Also use same group definition for all the consumers as well.
-	consumers, deleted := js.remapConsumerAssignments(accName, csa, true)
+	consumers, deleted, _ := js.remapConsumerAssignments(accName, csa, true)
 	if err := cc.meta.Propose(cc.term, encodeAddStreamAssignment(csa)); err != nil {
 		return false
 	}
@@ -5351,6 +5368,7 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 	alreadyRunning, numReplicas := osa.Group.node != nil, len(rg.Peers)
 	needsNode := rg.node == nil
 	storage, cfg := sa.Config.Storage, sa.Config
+	newCfg := cfg.atDesiredOrigin(rg)
 	recovering := sa.recovering
 	hasResponded := sa.markResponded()
 	hadErr := sa.err != nil
@@ -5421,7 +5439,7 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 		mset.setStreamAssignment(sa)
 
 		// Call update.
-		err = mset.updateWithAdvisory(cfg, !recovering, false)
+		err = mset.updateWithAdvisory(newCfg, !recovering, false)
 	}
 
 	// If not found we must be expanding into this node since if we are here we know we are a member.
@@ -5504,6 +5522,7 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 	js.mu.RLock()
 	s, rg, created := js.srv, sa.Group, sa.Created
 	alreadyRunning := rg.node != nil
+	newCfg := sa.Config.atDesiredOrigin(rg)
 	storage := sa.Config.Storage
 	restore := sa.Restore
 	recovering := sa.recovering
@@ -5579,8 +5598,8 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 			mset.setStreamAssignment(sa)
 			// Check if our config has really been updated.
 			cfg := mset.config()
-			if !reflect.DeepEqual(&cfg, sa.Config) {
-				if err = mset.updateWithAdvisory(sa.Config, false, false); err != nil {
+			if !reflect.DeepEqual(&cfg, newCfg) {
+				if err = mset.updateWithAdvisory(newCfg, false, false); err != nil {
 					if js.isShuttingDown() {
 						s.Debugf("Could not update stream, JetStream shutting down")
 						return
@@ -5602,7 +5621,7 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 			}
 		} else if err == NewJSStreamNotFoundError() {
 			// Add in the stream here.
-			mset, err = acc.addStreamWithAssignment(sa.Config, nil, sa, false, true)
+			mset, err = acc.addStreamWithAssignment(newCfg, nil, sa, false, true)
 		}
 		if mset != nil {
 			mset.setCreatedTime(created)
@@ -7820,16 +7839,16 @@ func (js *jetStream) reconcileDesiredStreamAssignment(_ *subscription, _ *client
 	// We stage consumer updates and do them after the stream update.
 	var consumers []*consumerAssignment
 
+	// If any consumers need to be remapped, we can't mark the stream's desired state done yet.
+	var done bool
+
 	// If the stream is scaling down and hasn't selected its final peer set yet,
 	// we need to wait before we remap.
-	checkConsumers := osa.Group.Desired == nil || !osa.Group.Desired.ScaleDown
-	if checkConsumers {
+	if osa.Group.Desired == nil || !osa.Group.Desired.ScaleDown {
 		// Need to remap any consumers.
-		consumers, _ = js.remapConsumerAssignments(reconcile.Account, osa, false)
+		consumers, _, done = js.remapConsumerAssignments(reconcile.Account, osa, false)
 	}
 
-	// If any consumers need to be remapped, we can't mark the stream's desired state done yet.
-	done := checkConsumers && len(consumers) == 0
 	ng := osa.Group.reconcileDesiredState(reconcile.desiredAssignmentUpdate, osa.Config.Replicas, done)
 	if ng != nil {
 		sa := osa.copyGroup()
@@ -8206,18 +8225,24 @@ func (cc *jetStreamCluster) remapStreamAssignment(sa *streamAssignment, removePe
 	return false
 }
 
+// Remaps the stream's consumers onto its target peer set. Also reports if all consumers have
+// converged, meaning none need to be remapped and none are still moving toward their desired
+// peer set.
 // Lock should be held.
-func (js *jetStream) remapConsumerAssignments(accName string, sa *streamAssignment, remove bool) (consumers, deleted []*consumerAssignment) {
+func (js *jetStream) remapConsumerAssignments(accName string, sa *streamAssignment, remove bool) (consumers, deleted []*consumerAssignment, done bool) {
 	targetPeers := sa.Group.Peers
 	if sa.Group.Desired != nil {
 		targetPeers = sa.Group.Desired.Peers
 	}
+	done = true
 	for ca := range js.consumerAssignmentsOrInflightSeq(accName, sa.Config.Name) {
 		if ca.Config == nil || ca.unsupported != nil {
 			continue
 		}
 		consumerPeers := ca.Group.Peers
 		if ca.Group.Desired != nil {
+			// Still moving toward its desired peer set.
+			done = false
 			consumerPeers = ca.Group.Desired.Peers
 		}
 		// Determine the desired replica count.
@@ -8282,7 +8307,9 @@ func (js *jetStream) remapConsumerAssignments(accName string, sa *streamAssignme
 		// We can not propose here before the stream itself so we collect them.
 		consumers = append(consumers, cca)
 	}
-	return consumers, deleted
+	// Any consumer we remap here still needs to move onto its new peer set.
+	done = done && len(consumers) == 0
+	return consumers, deleted, done
 }
 
 type selectPeerError struct {
@@ -8998,6 +9025,8 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 
 	// Check for replica changes.
 	isReplicaChange := newCfg.Replicas != osa.Config.Replicas
+	// A retention change might result in consumer replica changes.
+	isRetentionChange := newCfg.Retention != osa.Config.Retention
 
 	// FIXME(mvv): should move be prevented if already ongoing? maybe accept but with group size limits?
 	_ = isMoveCancel
@@ -9037,7 +9066,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 			rg.Peers = peerSet
 		}
 		rg = osa.Group.withDesired(rg)
-		rg.Desired.Rollback = &desiredRaftGroupRollback{
+		rg.Desired.Origin = &desiredRaftGroupOrigin{
 			Placement: osa.Config.Placement,
 		}
 	} else if isReplicaChange {
@@ -9092,6 +9121,20 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 	} else {
 		// All other updates make sure no preferred is set.
 		rg.Preferred = _EMPTY_
+	}
+
+	if isRetentionChange {
+		// Must always register desired state.
+		if rg.Desired == nil {
+			rg = osa.Group.withDesired(rg)
+		}
+		// But moving to Limits MUST be applied immediately, since there are no consumer parity restrictions there.
+		if newCfg.Retention != LimitsPolicy {
+			if rg.Desired.Origin == nil {
+				rg.Desired.Origin = &desiredRaftGroupOrigin{}
+			}
+			rg.Desired.Origin.Retention = &osa.Config.Retention
+		}
 	}
 
 	syncSubject := osa.Sync
@@ -11398,9 +11441,10 @@ func (js *jetStream) clusterInfo(rg *raftGroup) *ClusterInfo {
 			Name: d.Cluster,
 		}
 		// If desired state can be rolled back, include what can be rolled back to.
-		if d.Rollback != nil {
-			desired.Rollback = &DesiredClusterInfoRollback{
-				Placement: d.Rollback.Placement,
+		if d.Origin != nil {
+			desired.Origin = &DesiredClusterInfoOrigin{
+				Placement: d.Origin.Placement,
+				Retention: d.Origin.Retention,
 			}
 		}
 		// Don't populate peers if scaling down, since the peers aren't the desired set, it's

@@ -382,14 +382,16 @@ type ClusterInfo struct {
 // DesiredClusterInfo shows information of the desired set of servers
 // that should make up the stream or consumer.
 type DesiredClusterInfo struct {
-	Name     string      `json:"name,omitempty"`
-	Replicas []*PeerInfo `json:"replicas,omitempty"`
-	// A move can be canceled if a rollback is specified.
-	Rollback *DesiredClusterInfoRollback `json:"rollback,omitempty"`
+	Name     string                    `json:"name,omitempty"`
+	Replicas []*PeerInfo               `json:"replicas,omitempty"`
+	Origin   *DesiredClusterInfoOrigin `json:"origin,omitempty"`
 }
 
-type DesiredClusterInfoRollback struct {
+type DesiredClusterInfoOrigin struct {
+	// A move can be canceled to move back to the original placement if specified.
 	Placement *Placement `json:"placement,omitempty"`
+	// When changing between retention policies, this retention remains active until unset.
+	Retention *RetentionPolicy `json:"retention,omitempty"`
 }
 
 // PeerInfo shows information about all the peers in the cluster that
