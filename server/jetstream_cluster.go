@@ -220,6 +220,11 @@ func (rg *raftGroup) withDesired(target *raftGroup) *raftGroup {
 		Cluster:   target.Cluster,
 		Preferred: target.Preferred,
 	}
+	// Must preserve the prior origin (if any).
+	if rg.Desired != nil && rg.Desired.Origin != nil {
+		origin := *rg.Desired.Origin
+		ng.Desired.Origin = &origin
+	}
 	return ng
 }
 
@@ -9066,8 +9071,12 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 			rg.Peers = peerSet
 		}
 		rg = osa.Group.withDesired(rg)
-		rg.Desired.Origin = &desiredRaftGroupOrigin{
-			Placement: osa.Config.Placement,
+		// Only record the placement if we hadn't already recorded it.
+		if d := osa.Group.Desired; d == nil || d.Origin == nil || d.Origin.Placement == nil {
+			if rg.Desired.Origin == nil {
+				rg.Desired.Origin = &desiredRaftGroupOrigin{}
+			}
+			rg.Desired.Origin.Placement = osa.Config.Placement
 		}
 	} else if isReplicaChange {
 		currentPeers := rg.Peers
@@ -9130,13 +9139,11 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 		}
 		// But moving to Limits MUST be applied immediately, since there are no consumer parity restrictions there.
 		if newCfg.Retention != LimitsPolicy {
-			if rg.Desired.Origin == nil {
-				rg.Desired.Origin = &desiredRaftGroupOrigin{}
-			}
-			if d := osa.Group.Desired; d != nil && d.Origin != nil && d.Origin.Retention != nil {
-				// Preserve the previous origin's retention, as we'd otherwise clobber it.
-				rg.Desired.Origin.Retention = d.Origin.Retention
-			} else {
+			// Only record the retention if we hadn't already recorded it.
+			if d := osa.Group.Desired; d == nil || d.Origin == nil || d.Origin.Retention == nil {
+				if rg.Desired.Origin == nil {
+					rg.Desired.Origin = &desiredRaftGroupOrigin{}
+				}
 				rg.Desired.Origin.Retention = &osa.Config.Retention
 			}
 		}
