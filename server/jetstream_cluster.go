@@ -8182,22 +8182,34 @@ func (js *jetStream) processLeaderChange(isLeader bool, term uint64) {
 
 // Lock should be held.
 func (cc *jetStreamCluster) remapStreamAssignment(sa *streamAssignment, removePeer string) bool {
+	// If the group is already converging toward a desired peer set, that set is what
+	// actually drives membership, so base the replacement on it. Otherwise we'd hand back
+	// a peer set that the in-flight migration reconciles right back over.
+	basePeers := sa.Group.Peers
+	if d := sa.Group.Desired; d != nil {
+		basePeers = d.Peers
+	}
+
 	// Invoke placement algo passing RG peers that stay (existing) and the peer that is being removed (ignore)
-	var retain, ignore []string
-	for _, v := range sa.Group.Peers {
-		if v == removePeer {
-			ignore = append(ignore, v)
-		} else {
+	retain, ignore := make([]string, 0, len(basePeers)), []string{removePeer}
+	for _, v := range basePeers {
+		if v != removePeer {
 			retain = append(retain, v)
 		}
 	}
 
-	newPeers, placementError := cc.selectPeerGroup(len(sa.Group.Peers), sa.Group.Cluster, sa.Config, retain, 0, ignore)
+	newPeers, placementError := cc.selectPeerGroup(len(basePeers), sa.Group.Cluster, sa.Config, retain, 0, ignore)
 
 	if placementError == nil {
 		sa.Group.Peers = newPeers
 		// Don't influence preferred leader.
 		sa.Group.Preferred = _EMPTY_
+		// Keep the desired peer set in sync, it must not retain the removed peer.
+		if d := sa.Group.Desired; d != nil {
+			d.ID = nuid.Next()
+			d.Peers = newPeers
+			d.Preferred = _EMPTY_
+		}
 		return true
 	}
 
@@ -8207,12 +8219,19 @@ func (cc *jetStreamCluster) remapStreamAssignment(sa *streamAssignment, removePe
 	}
 
 	// If we are here let's remove the peer at least, as long as we are R>1
-	for i, peer := range sa.Group.Peers {
-		if peer == removePeer {
-			sa.Group.Peers[i] = sa.Group.Peers[len(sa.Group.Peers)-1]
-			sa.Group.Peers = sa.Group.Peers[:len(sa.Group.Peers)-1]
-			break
+	removeFrom := func(peers []string) []string {
+		for i, peer := range peers {
+			if peer == removePeer {
+				peers[i] = peers[len(peers)-1]
+				return peers[:len(peers)-1]
+			}
 		}
+		return peers
+	}
+	sa.Group.Peers = removeFrom(sa.Group.Peers)
+	if d := sa.Group.Desired; d != nil {
+		d.ID = nuid.Next()
+		d.Peers = removeFrom(d.Peers)
 	}
 	return false
 }
