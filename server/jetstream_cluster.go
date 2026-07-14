@@ -3163,23 +3163,6 @@ func (mset *stream) removeNode() {
 	}
 }
 
-// Helper function to generate peer info.
-// lists and sets for old and new.
-func genPeerInfo(peers []string, split int) (newPeers, oldPeers []string, newPeerSet, oldPeerSet map[string]bool) {
-	newPeers = peers[split:]
-	oldPeers = peers[:split]
-	newPeerSet = make(map[string]bool, len(newPeers))
-	oldPeerSet = make(map[string]bool, len(oldPeers))
-	for i, peer := range peers {
-		if i < split {
-			oldPeerSet[peer] = true
-		} else {
-			newPeerSet[peer] = true
-		}
-	}
-	return
-}
-
 // This will wait for a period of time until all consumers are registered and have
 // their consumer assignments assigned.
 // Should only be called from monitorStream.
@@ -7890,6 +7873,10 @@ func (js *jetStream) reconcileDesiredConsumerAssignment(_ *subscription, _ *clie
 		return
 	}
 
+	osa := js.streamAssignmentOrInflight(reconcile.Account, reconcile.Stream)
+	if osa == nil || osa.Group == nil {
+		return
+	}
 	oca := js.consumerAssignmentOrInflight(reconcile.Account, reconcile.Stream, reconcile.Consumer)
 	if oca == nil || oca.Group == nil || oca.unsupported != nil || reconcile.Leader == _EMPTY_ {
 		return
@@ -7898,10 +7885,6 @@ func (js *jetStream) reconcileDesiredConsumerAssignment(_ *subscription, _ *clie
 	// in the stream's peer assignment yet. Otherwise, we'd add a consumer peer where
 	// a stream isn't hosted yet.
 	if len(reconcile.MetaPeers) > 0 {
-		osa := js.streamAssignmentOrInflight(reconcile.Account, reconcile.Stream)
-		if osa == nil || osa.Group == nil {
-			return
-		}
 		for _, peer := range reconcile.MetaPeers {
 			if slices.Contains(oca.Group.Peers, peer) {
 				continue
@@ -7911,7 +7894,8 @@ func (js *jetStream) reconcileDesiredConsumerAssignment(_ *subscription, _ *clie
 			}
 		}
 	}
-	ng := oca.Group.reconcileDesiredState(reconcile.desiredAssignmentUpdate, oca.Config.Replicas, true)
+	replicas := oca.Config.replicas(osa.Config)
+	ng := oca.Group.reconcileDesiredState(reconcile.desiredAssignmentUpdate, replicas, true)
 	if ng == nil {
 		return
 	}
@@ -7937,7 +7921,10 @@ func (rg *raftGroup) reconcileDesiredState(reconcile desiredAssignmentUpdate, re
 			return nil
 		}
 		ng := rg.copyGroup()
-		newPeers, _, _, _ := genPeerInfo(rg.Peers, replicas)
+		newPeers := rg.Peers
+		if len(newPeers) > replicas {
+			newPeers = newPeers[len(newPeers)-replicas:]
+		}
 		ng.Peers = newPeers
 		ng = rg.withDesired(ng)
 		ng.Desired.Leader = reconcile.Leader
@@ -8306,9 +8293,13 @@ func (js *jetStream) remapConsumerAssignments(accName string, sa *streamAssignme
 			cfg.Replicas = r
 			cca.Config = &cfg
 		}
-		cca.Group = ca.Group.withDesired(cca.Group)
-		// Scaled down if we kept at least one peer, but removed others.
-		cca.Group.Desired.ScaleDown = kept > 0 && kept != len(consumerPeers)
+		// Only use desired state if the stream did as well.
+		// TODO(mvv): improve peer-remove
+		if sa.Group.Desired != nil {
+			cca.Group = ca.Group.withDesired(cca.Group)
+			// Scaled down if we kept at least one peer, but removed others.
+			cca.Group.Desired.ScaleDown = kept > 0 && kept != len(consumerPeers)
+		}
 		// We can not propose here before the stream itself so we collect them.
 		consumers = append(consumers, cca)
 	}
