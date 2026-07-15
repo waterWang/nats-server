@@ -9143,6 +9143,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 	}
 
 	if isRetentionChange {
+		// FIXME(mvv): skip desired state if changing an R1 without desired state
 		// Must always register desired state.
 		if rg.Desired == nil {
 			rg = osa.Group.withDesired(rg)
@@ -10325,9 +10326,6 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 		nca.Reply = reply
 		ca = nca
 	}
-
-	// FIXME(mvv): if the assignment already has a desired state but did not change here.. then we need to change the ID regardless
-
 	// Do formal proposal.
 	if err := cc.meta.Propose(cc.term, encodeAddConsumerAssignment(ca)); err != nil {
 		return
