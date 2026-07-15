@@ -2704,6 +2704,8 @@ func (s *Server) jsLeaderServerStreamMoveRequest(sub *subscription, c *client, _
 			if len(newPeers) >= cfg.Replicas {
 				peers = append([]string{}, currPeers...)
 				peers = append(peers, newPeers[:cfg.Replicas]...)
+				// Keep only the new peers.
+				peers = peers[len(peers)-cfg.Replicas:]
 				break
 			}
 			errs.accumulate(e)
@@ -2713,6 +2715,9 @@ func (s *Server) jsLeaderServerStreamMoveRequest(sub *subscription, c *client, _
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
+	} else {
+		// Keep only the new peers.
+		peers = peers[len(peers)-cfg.Replicas:]
 	}
 
 	cfg.Placement = origPlacement
