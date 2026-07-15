@@ -7492,6 +7492,9 @@ func TestJetStreamClusterStreamScaleDownChangesRaftGroup(t *testing.T) {
 	cfg.Replicas = 1
 	_, err = js.UpdateStream(cfg)
 	require_NoError(t, err)
+	// Wait for scale down to finish, since the group is NOT changed if scaling
+	// too fast since it would remain replicated throughout.
+	c.waitOnStreamLeader(globalAccountName, "TEST")
 	// Publish a couple more messages while it's R1.
 	for range 2 {
 		_, err = js.Publish("foo", []byte("B"))

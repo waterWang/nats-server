@@ -3505,10 +3505,6 @@ func TestJetStreamSuperClusterMoveCancel(t *testing.T) {
 		require_NoError(t, err)
 		var cancelResp JSApiStreamUpdateResponse
 		require_NoError(t, json.Unmarshal(rmsg.Data, &cancelResp))
-		if cancelResp.Error != nil && ErrorIdentifier(cancelResp.Error.ErrCode) == JSStreamMoveNotInProgress {
-			t.Skip("This can happen with delays, when Move completed before Cancel", cancelResp.Error)
-			return
-		}
 		require_True(t, cancelResp.Error == nil)
 
 		for _, sExpected := range streamPeerSrv {

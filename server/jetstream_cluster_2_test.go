@@ -7338,6 +7338,7 @@ func TestJetStreamClusterStreamCatchupInteriorNilMsgs(t *testing.T) {
 	cfg.Replicas = 3
 	_, err = js.UpdateStream(cfg)
 	require_NoError(t, err)
+	c.waitOnStreamLeader("$G", "TEST")
 	nl := c.randomNonStreamLeader("$G", "TEST")
 	c.waitOnStreamCurrent(nl, "$G", "TEST")
 
