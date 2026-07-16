@@ -3949,7 +3949,7 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 
 	// If scaling down, we need to select where to.
 	if desired.ScaleDown {
-		update.ScaleDownPeers = s.selectScaleDownPeers(desired.Peers, ourPeerId, actual, replicas)
+		update.ScaleDownPeers = s.selectScaleDownPeers(ourPeerId, actual, desired.Peers, replicas)
 		js.mu.RUnlock()
 		sendMetaUpdate()
 		return
@@ -7081,7 +7081,7 @@ func (js *jetStream) runConsumerMigration(ca *consumerAssignment, n RaftNode, le
 
 	// If scaling down, we need to select where to.
 	if desired.ScaleDown {
-		update.ScaleDownPeers = s.selectScaleDownPeers(desired.Peers, ourPeerId, actual, replicas)
+		update.ScaleDownPeers = s.selectScaleDownPeers(ourPeerId, actual, desired.Peers, replicas)
 		js.mu.RUnlock()
 		sendMetaUpdate()
 		return
@@ -9391,124 +9391,82 @@ func (s *Server) allPeersOffline(rg *raftGroup) bool {
 	return true
 }
 
-// Select the peers to keep when scaling a raft group down to replicas.
-// The current leader, if known and in peer set, is kept. Online peers are preferred,
-// but we will fall back to offline peers to honor the requested replica count.
-// FIXME(mvv): simplify and take lag into account
-func (s *Server) selectScaleDownPeers(peers []string, curLeader string, current []*Peer, replicas int) []string {
-	selected := make([]string, 0, replicas)
-	if curLeader != _EMPTY_ && slices.Contains(peers, curLeader) {
-		selected = append(selected, curLeader)
-		if len(selected) == replicas {
-			return selected
-		}
-	}
-	// Prefer current peers.
-	for _, peer := range current {
-		if peer.ID == curLeader || !slices.Contains(peers, peer.ID) {
-			continue
-		}
-		selected = append(selected, peer.ID)
-		if len(selected) == replicas {
-			return selected
-		}
-	}
-	// Prefer online peers.
-	for _, peer := range peers {
-		if peer == curLeader {
-			continue
-		}
-		if slices.Contains(selected, peer) {
-			continue
-		}
-		if si, ok := s.nodeToInfo.Load(peer); ok && si != nil && !si.(nodeInfo).offline {
-			selected = append(selected, peer)
-			if len(selected) == replicas {
-				return selected
-			}
-		}
-	}
-
-	// Fall back to offline peers for the remainder.
-	for _, peer := range peers {
-		if slices.Contains(selected, peer) {
-			continue
-		}
-		selected = append(selected, peer)
-		if len(selected) == replicas {
-			break
-		}
-	}
-	return selected
-}
-
-// selectPeerToRemove picks a peer from remaining to remove during scale-down.
-// Priority order (most-likely-safe to remove first):
-//  1. offline: oldest first
-//  2. not current: online but not current (not required for quorum)
-//  3. current: online and caught up
-//
-// FIXME(mvv): simplify like above
-func (s *Server) selectPeerToRemove(current []*Peer, remaining []string) string {
-	if len(remaining) == 0 {
-		return _EMPTY_
-	}
-
-	const (
-		tierOffline       = iota // server is offline
-		tierNotCurrent           // online but raft state is behind / not caught up
-		tierOnlineCurrent        // online and caught up
-		tierUnset                // sentinel: no candidate evaluated yet
-	)
-
+// sortScaleDownPeers returns the candidate peers sorted by how preferable
+// they are to keep when scaling a raft group down, most preferable first:
+//  1. the current leader, if known and a candidate
+//  2. peers in the current peer set that are online, least lag first
+//  3. peers in the current peer set that are offline, least lag first
+//  4. peers not in the current peer set, these are treated as offline
+func (s *Server) sortScaleDownPeers(curLeader string, current []*Peer, candidates []string) []string {
 	peers := make(map[string]*Peer, len(current))
 	for _, p := range current {
 		peers[p.ID] = p
 	}
 
-	now := time.Now()
-	best, bestTier := _EMPTY_, tierUnset
-	var bestLast time.Time
-
-	for _, id := range remaining {
-		rp := peers[id]
-
-		// Unknown peers are treated as offline, matching how other cluster code does it.
+	// Rank each candidate: a lower tier is more preferable to keep, lag breaks
+	// ties within a tier. Candidate order breaks any remaining ties.
+	type rank struct {
+		tier int
+		lag  uint64
+	}
+	ranks := make(map[string]rank, len(candidates))
+	for _, id := range candidates {
+		if id == curLeader {
+			ranks[id] = rank{tier: 0}
+			continue
+		}
+		p := peers[id]
+		if p == nil {
+			ranks[id] = rank{tier: 3}
+			continue
+		}
+		// Unknown peers are treated as offline.
 		offline := true
-		if sir, ok := s.nodeToInfo.Load(id); ok && sir != nil {
-			offline = sir.(nodeInfo).offline
+		if si, ok := s.nodeToInfo.Load(id); ok && si != nil {
+			offline = si.(nodeInfo).offline
 		}
-
-		tier := tierOnlineCurrent
-		var last time.Time
-		switch {
-		case offline:
-			tier = tierOffline
-			if rp != nil {
-				last = rp.Last
-			}
-		case rp == nil:
-			tier = tierNotCurrent
-		default:
-			current := rp.Current
-			// Mirror clusterInfo's view: a "current" peer we haven't heard from
-			// in lostQuorumInterval is treated as not current.
-			if current && !rp.Last.IsZero() && now.Sub(rp.Last) > lostQuorumInterval {
-				current = false
-			}
-			if !current {
-				tier = tierNotCurrent
-			}
-		}
-
-		// Lower tier wins. Within tierOffline, the earlier Last wins — and
-		// time.Time's zero value is "before" any real time, so never-seen peers
-		// naturally sort ahead of peers we have heard from.
-		if tier < bestTier || (tier == tierOffline && bestTier == tierOffline && last.Before(bestLast)) {
-			best, bestTier, bestLast = id, tier, last
+		if offline {
+			ranks[id] = rank{tier: 2, lag: p.Lag}
+		} else {
+			ranks[id] = rank{tier: 1, lag: p.Lag}
 		}
 	}
-	return best
+
+	sorted := copyStrings(candidates)
+	slices.SortStableFunc(sorted, func(a, b string) int {
+		ra, rb := ranks[a], ranks[b]
+		if ra.tier != rb.tier {
+			return cmp.Compare(ra.tier, rb.tier)
+		}
+		return cmp.Compare(ra.lag, rb.lag)
+	})
+	return sorted
+}
+
+// Select the peers to keep when scaling a raft group down to replicas.
+// The current leader, if known and a candidate, is always kept. Online peers
+// with the least lag are preferred, but we will fall back to offline peers to
+// honor the requested replica count.
+func (s *Server) selectScaleDownPeers(curLeader string, current []*Peer, peers []string, replicas int) []string {
+	sorted := s.sortScaleDownPeers(curLeader, current, peers)
+	if len(sorted) > replicas {
+		sorted = sorted[:replicas]
+	}
+	return sorted
+}
+
+// selectPeerToRemove picks the peer from remaining that is most preferable to
+// remove during scale-down: peers unknown to the group first, then offline
+// peers, then online peers with the most lag.
+func (s *Server) selectPeerToRemove(current []*Peer, peers []string) string {
+	if len(peers) == 0 {
+		return _EMPTY_
+	}
+	sorted := s.sortScaleDownPeers(_EMPTY_, current, peers)
+	if len(sorted) == 0 {
+		return _EMPTY_
+	}
+	return sorted[len(sorted)-1]
 }
 
 // This will do a scatter and gather operation for all streams for this account. This is only called from metadata leader.
