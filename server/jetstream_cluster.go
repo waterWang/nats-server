@@ -190,8 +190,13 @@ type desiredRaftGroup struct {
 	Origin *desiredRaftGroupOrigin `json:"origin,omitempty"`
 }
 
+// desiredRaftGroupOrigin specifies the original properties of the asset before any desired state changes were made.
+// Multiple desired state changes MUST NOT update these values, only the initial values must be set, allowing to
+// revert to before any changes were made.
 type desiredRaftGroupOrigin struct {
-	// A move can be canceled to move back to the original placement if specified.
+	Peers     []string   `json:"peers"`
+	Cluster   string     `json:"cluster,omitempty"`
+	Replicas  int        `json:"replicas"`
 	Placement *Placement `json:"placement,omitempty"`
 	// When changing between retention policies, this retention remains active until unset.
 	Retention *RetentionPolicy `json:"retention,omitempty"`
@@ -2652,6 +2657,12 @@ func (js *jetStream) processAddPeer(peer string) {
 			// If we are here we can add in this peer.
 			csa := sa.copyGroup()
 			csa.Group.Peers = append(csa.Group.Peers, peer)
+			// Keep the desired peer set in sync, it must not retain the removed peer.
+			if d := csa.Group.Desired; d != nil {
+				d.ID = nuid.Next()
+				d.Peers = csa.Group.Peers
+				d.Preferred = _EMPTY_
+			}
 			// Send our proposal for this csa. Also use same group definition for all the consumers as well.
 			consumers, _, _ := js.remapConsumerAssignments(accName, csa, false)
 			if err := cc.meta.Propose(cc.term, encodeAddStreamAssignment(csa)); err != nil {
@@ -9138,13 +9149,6 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 			rg.Peers = peerSet
 		}
 		rg = osa.Group.withDesired(rg)
-		// Only record the placement if we hadn't already recorded it.
-		if d := osa.Group.Desired; d == nil || d.Origin == nil || d.Origin.Placement == nil {
-			if rg.Desired.Origin == nil {
-				rg.Desired.Origin = &desiredRaftGroupOrigin{}
-			}
-			rg.Desired.Origin.Placement = osa.Config.Placement
-		}
 	} else if isReplicaChange {
 		currentPeers := rg.Peers
 		if osa.Group.Desired != nil {
@@ -9199,6 +9203,16 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 		rg.Preferred = _EMPTY_
 	}
 
+	// If we're the first to specify an origin, capture it.
+	if rg.Desired != nil && rg.Desired.Origin == nil {
+		rg.Desired.Origin = &desiredRaftGroupOrigin{
+			Peers:     osa.Group.Peers,
+			Cluster:   osa.Group.Cluster,
+			Replicas:  osa.Config.Replicas,
+			Placement: osa.Config.Placement,
+		}
+	}
+
 	// A retention change should go through desired state, unless it is a singleton without desired state.
 	if isRetentionChange && !(rg.Desired == nil && len(rg.Peers) == 1) {
 		// Must always register desired state.
@@ -9206,6 +9220,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 			rg = osa.Group.withDesired(rg)
 		}
 		// But moving to Limits MUST be applied immediately, since there are no consumer parity restrictions there.
+		// FIXME(mvv): should previous origin retention be removed?
 		if newCfg.Retention != LimitsPolicy {
 			// Only record the retention if we hadn't already recorded it.
 			if d := osa.Group.Desired; d == nil || d.Origin == nil || d.Origin.Retention == nil {

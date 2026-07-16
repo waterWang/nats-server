@@ -388,7 +388,7 @@ type DesiredClusterInfo struct {
 }
 
 type DesiredClusterInfoOrigin struct {
-	// A move can be canceled to move back to the original placement if specified.
+	// Original placement before it was updated.
 	Placement *Placement `json:"placement,omitempty"`
 	// When changing between retention policies, this retention remains active until unset.
 	Retention *RetentionPolicy `json:"retention,omitempty"`

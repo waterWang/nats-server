@@ -7603,6 +7603,9 @@ func TestJetStreamClusterStreamRescaleCatchup(t *testing.T) {
 		cfg.Replicas = 1
 		_, err = js.UpdateStream(cfg)
 		require_NoError(t, err)
+		// Wait for scale down to finish, since the group is NOT changed if scaling
+		// too fast since it would remain replicated throughout.
+		c.waitOnStreamLeader(globalAccountName, "TEST")
 		cfg.Replicas = 3
 		_, err = js.UpdateStream(cfg)
 		require_NoError(t, err)
@@ -7748,10 +7751,13 @@ func TestJetStreamClusterConsumerScaleDownChangesRaftGroup(t *testing.T) {
 	n := mset.lookupConsumer("CONSUMER").raftNode()
 	old := n.Group()
 
-	// Scale stream down and back up.
+	// Scale consumer down and back up.
 	cfg.Replicas = 1
 	_, err = js.UpdateConsumer("TEST", cfg)
 	require_NoError(t, err)
+	// Wait for scale down to finish, since the group is NOT changed if scaling
+	// too fast since it would remain replicated throughout.
+	c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER")
 	cfg.Replicas = 3
 	_, err = js.UpdateConsumer("TEST", cfg)
 	require_NoError(t, err)
@@ -7833,10 +7839,13 @@ func TestJetStreamClusterConsumerRescaleCatchup(t *testing.T) {
 		rs.Shutdown()
 		rs.WaitForShutdown()
 
-		// Scale stream down and back up.
+		// Scale consumer down and back up.
 		cfg.Replicas = 1
 		_, err = js.UpdateConsumer("TEST", cfg)
 		require_NoError(t, err)
+		// Wait for scale down to finish, since the group is NOT changed if scaling
+		// too fast since it would remain replicated throughout.
+		c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER")
 		cfg.Replicas = 3
 		_, err = js.UpdateConsumer("TEST", cfg)
 		require_NoError(t, err)

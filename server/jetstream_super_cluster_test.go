@@ -3357,17 +3357,13 @@ func TestJetStreamSuperClusterTagInducedMoveCancel(t *testing.T) {
 		require_NoError(t, json.Unmarshal(rmsg.Data, &cancelResp))
 		return nil
 	})
-	if cancelResp.Error != nil && ErrorIdentifier(cancelResp.Error.ErrCode) == JSStreamMoveNotInProgress {
-		t.Skip("This can happen with delays, when Move completed before Cancel", cancelResp.Error)
-		return
-	}
 	require_True(t, cancelResp.Error == nil)
 
 	checkFor(t, 10*time.Second, 250*time.Millisecond, func() error {
 		si, err := js.StreamInfo("TEST")
 		require_NoError(t, err)
-		if si.Config.Placement != nil {
-			return fmt.Errorf("expected placement to be cleared got: %+v", si.Config.Placement)
+		if !reflect.DeepEqual(si.Config.Placement, &nats.Placement{Tags: []string{"C1"}}) {
+			return fmt.Errorf("expected placement to be back to initial state got: %+v", si.Config.Placement)
 		}
 		return nil
 	})
