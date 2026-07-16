@@ -7986,13 +7986,16 @@ func (rg *raftGroup) reconcileDesiredState(reconcile desiredAssignmentUpdate, re
 	ng := rg.copyGroup()
 	ng.Peers = reconcile.MetaPeers
 
+	// Compare on sorted copies, so we don't clobber the peer ordering.
 	desiredPeers := copyStrings(rg.Desired.Peers)
+	metaPeers := copyStrings(reconcile.MetaPeers)
 	slices.Sort(desiredPeers)
-	slices.Sort(reconcile.MetaPeers)
-	exactMatch := slices.Equal(desiredPeers, reconcile.MetaPeers)
+	slices.Sort(metaPeers)
+	exactMatch := slices.Equal(desiredPeers, metaPeers)
 	if exactMatch && reconcile.PeersMatch && done {
 		// We're done, reset the desired state fields and finalize the assignment.
-		ng.Cluster = rg.Desired.Cluster
+		ng.Peers = ng.Desired.Peers
+		ng.Cluster = ng.Desired.Cluster
 		ng.Preferred = _EMPTY_
 		ng.Desired = nil
 	} else {
