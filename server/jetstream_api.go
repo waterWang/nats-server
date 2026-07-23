@@ -2825,7 +2825,7 @@ func (s *Server) jsLeaderServerStreamCancelMoveRequest(sub *subscription, c *cli
 		s.Noticef("Requested cancel of move: R=%d '%s > %s' to peer set %+v and restore previous peer set %+v",
 			origin.Replicas, accName, streamName, s.peerSetToNames(currPeers), s.peerSetToNames(origin.Peers))
 
-		if err := cc.meta.Propose(encodeAddStreamAssignment(csa)); err != nil {
+		if err := cc.meta.Propose(cc.term, encodeAddStreamAssignment(csa)); err != nil {
 			return
 		}
 		cc.trackInflightStreamProposal(accName, csa, false)
