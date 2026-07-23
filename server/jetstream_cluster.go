@@ -3931,12 +3931,26 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 	// part in this migration, so remove it from the group right away rather than
 	// waiting for the rest of the migration to complete.
 	current, metaPeers := copyStrings(sa.Group.Peers), meta.PeerNames()
+	var evicted []string
 	for _, peer := range actualPeers {
 		if !slices.Contains(current, peer) || !slices.Contains(metaPeers, peer) {
-			js.mu.RUnlock()
-			n.ProposeRemovePeer(peer)
-			return
+			evicted = append(evicted, peer)
 		}
+	}
+	if len(evicted) > 0 {
+		// Remove evicted peers one at a time, the leader last so leadership stays
+		// stable throughout. Step down and perform a leader transfer if we'd remove
+		// ourselves, preferring a successor that is already in the desired peer set.
+		remove := s.selectPeerToRemove(ourPeerId, actual, evicted)
+		if remove == ourPeerId {
+			preferred := s.selectStepDownPreferred(ourPeerId, actual, desiredPeers)
+			js.mu.RUnlock()
+			n.StepDown(preferred)
+		} else {
+			js.mu.RUnlock()
+			n.ProposeRemovePeer(remove)
+		}
+		return
 	}
 
 	// Extend the actual peer set through the log, but only if it's part of the desired set.
@@ -4009,10 +4023,18 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 				}
 			}
 		}
-		js.mu.RUnlock()
-		n.ProposeRemovePeer(s.selectPeerToRemove(actual, remaining))
+		// Step down and perform a leader transfer if we'd remove ourselves. We are
+		// selected last, so leadership changes at most once, and every remaining
+		// member is already in the desired peer set so any successor works.
+		remove := s.selectPeerToRemove(ourPeerId, actual, remaining)
+		if remove == ourPeerId {
+			js.mu.RUnlock()
+			n.StepDown()
+		} else {
+			js.mu.RUnlock()
+			n.ProposeRemovePeer(remove)
+		}
 		return
-
 	}
 
 	// We're done.
@@ -7056,18 +7078,26 @@ func (js *jetStream) runConsumerMigration(ca *consumerAssignment, n RaftNode, le
 	// part in this migration, so remove it from the group right away rather than
 	// waiting for the rest of the migration to complete.
 	current, metaPeers := copyStrings(ca.Group.Peers), meta.PeerNames()
+	var evicted []string
 	for _, peer := range actualPeers {
 		if !slices.Contains(current, peer) || !slices.Contains(metaPeers, peer) {
-			js.mu.RUnlock()
-			// Step down and perform a leader transfer if we'd remove ourselves.
-			// FIXME(mvv): also do this for stream, and should select a peer in the other set (or remove leader last)
-			if peer == ourPeerId {
-				n.StepDown()
-			} else {
-				n.ProposeRemovePeer(peer)
-			}
-			return
+			evicted = append(evicted, peer)
 		}
+	}
+	if len(evicted) > 0 {
+		// Remove evicted peers one at a time, the leader last so leadership stays
+		// stable throughout. Step down and perform a leader transfer if we'd remove
+		// ourselves, preferring a successor that is already in the desired peer set.
+		remove := s.selectPeerToRemove(ourPeerId, actual, evicted)
+		if remove == ourPeerId {
+			preferred := s.selectStepDownPreferred(ourPeerId, actual, desiredPeers)
+			js.mu.RUnlock()
+			n.StepDown(preferred)
+		} else {
+			js.mu.RUnlock()
+			n.ProposeRemovePeer(remove)
+		}
+		return
 	}
 
 	// Extend the actual peer set through the log, but only if it's part of the desired set.
@@ -7134,12 +7164,15 @@ func (js *jetStream) runConsumerMigration(ca *consumerAssignment, n RaftNode, le
 
 	// If the peer sets are an exact match, we can remove a peer.
 	if len(remaining) > 0 && exactMatch {
-		js.mu.RUnlock()
-		// Step down and perform a leader transfer if we'd remove ourselves.
-		remove := s.selectPeerToRemove(actual, remaining)
+		// Step down and perform a leader transfer if we'd remove ourselves. We are
+		// selected last, so leadership changes at most once, and every remaining
+		// member is already in the desired peer set so any successor works.
+		remove := s.selectPeerToRemove(ourPeerId, actual, remaining)
 		if remove == ourPeerId {
+			js.mu.RUnlock()
 			n.StepDown()
 		} else {
+			js.mu.RUnlock()
 			n.ProposeRemovePeer(remove)
 		}
 		return
@@ -9462,16 +9495,34 @@ func (s *Server) selectScaleDownPeers(curLeader string, current []*Peer, peers [
 
 // selectPeerToRemove picks the peer from remaining that is most preferable to
 // remove during scale-down: peers unknown to the group first, then offline
-// peers, then online peers with the most lag.
-func (s *Server) selectPeerToRemove(current []*Peer, peers []string) string {
+// peers, then online peers with the most lag. The current leader, if among the
+// candidates, is picked last so leadership is transferred at most once.
+func (s *Server) selectPeerToRemove(curLeader string, current []*Peer, peers []string) string {
 	if len(peers) == 0 {
 		return _EMPTY_
 	}
-	sorted := s.sortScaleDownPeers(_EMPTY_, current, peers)
+	sorted := s.sortScaleDownPeers(curLeader, current, peers)
 	if len(sorted) == 0 {
 		return _EMPTY_
 	}
 	return sorted[len(sorted)-1]
+}
+
+// selectStepDownPreferred picks the peer to transfer leadership to before the
+// current leader removes itself from the group: the most preferable member of
+// the desired peer set. Empty if no desired peer is part of the group yet.
+func (s *Server) selectStepDownPreferred(ourPeerId string, current []*Peer, desired []string) string {
+	var candidates []string
+	for _, p := range current {
+		if p.ID != ourPeerId && slices.Contains(desired, p.ID) {
+			candidates = append(candidates, p.ID)
+		}
+	}
+	sorted := s.sortScaleDownPeers(_EMPTY_, current, candidates)
+	if len(sorted) == 0 {
+		return _EMPTY_
+	}
+	return sorted[0]
 }
 
 // This will do a scatter and gather operation for all streams for this account. This is only called from metadata leader.
