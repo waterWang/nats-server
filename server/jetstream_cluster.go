@@ -178,8 +178,10 @@ type raftGroup struct {
 // desiredGroupPlacement specifies the desired peer set.
 // A stream or consumer raftGroup can be scaled or moved safely based on this desired state.
 type desiredRaftGroup struct {
-	ID        string   `json:"id"`
-	Leader    string   `json:"leader,omitempty"`
+	ID string `json:"id"`
+	// Term is the raft term of the group leader driving this desired state. It acts as a
+	// fencing token; reconcile requests from older leadership terms are rejected.
+	Term      uint64   `json:"term,omitempty"`
 	Peers     []string `json:"peers"`
 	Cluster   string   `json:"cluster,omitempty"`
 	Preferred string   `json:"preferred,omitempty"`
@@ -212,15 +214,15 @@ func (rg *raftGroup) withDesired(target *raftGroup) *raftGroup {
 		// Don't carry a stale preferred into the desired group.
 		target.Preferred = _EMPTY_
 	}
-	var leader string
+	var term uint64
 	if target.Desired != nil {
-		leader = target.Desired.Leader
+		term = target.Desired.Term
 	}
 	ng := rg.copyGroup()
 	ng.Name = target.Name
 	ng.Desired = &desiredRaftGroup{
 		ID:        nuid.Next(),
-		Leader:    leader,
+		Term:      term,
 		Peers:     target.Peers,
 		Cluster:   target.Cluster,
 		Preferred: target.Preferred,
@@ -3293,6 +3295,7 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 
 	js.mu.RLock()
 	isLeader := cc.isStreamLeader(sa.Client.serviceAccount(), sa.Config.Name)
+	var leaderTerm uint64
 	isRestore := sa.Restore != nil
 	js.mu.RUnlock()
 
@@ -3424,13 +3427,11 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 	// For migration tracking.
 	var mmt *time.Timer
 	var mmtc <-chan time.Time
-	var mmLeaderID string
 
 	startMigrationMonitoring := func() {
 		if mmt == nil {
 			mmt = time.NewTimer(migrateFastCheckInterval)
 			mmtc = mmt.C
-			mmLeaderID = nuid.Next()
 		} else {
 			mmt.Reset(migrateFastCheckInterval)
 		}
@@ -3628,7 +3629,7 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 			}
 
 		case lc := <-lch:
-			isLeader = lc.isLeader
+			isLeader, leaderTerm = lc.isLeader, lc.term
 			// Process our leader change.
 			js.processStreamLeaderChange(mset, isLeader, lc.term)
 
@@ -3748,7 +3749,7 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 			}
 			// Reset to the slower fallback speed.
 			mmt.Reset(migrateFallbackCheckInterval)
-			js.runStreamMigration(mset, sa, n, mmLeaderID)
+			js.runStreamMigration(mset, sa, n, leaderTerm)
 
 		case err := <-restoreDoneCh:
 			// We have completed a restore from snapshot on this server. The stream assignment has
@@ -3871,7 +3872,7 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 }
 
 // Migrate a stream from peer set A to peer set B. Returns true when migration is done.
-func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n RaftNode, leaderID string) {
+func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n RaftNode, leaderTerm uint64) {
 	ourPeerId, cc, s := n.ID(), js.cluster, js.srv
 
 	//// Check to see where we are..
@@ -3894,19 +3895,19 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 	meta := cc.meta
 	accName, streamName, replicas := sa.Client.serviceAccount(), sa.Config.Name, sa.Config.Replicas
 
-	update := desiredAssignmentUpdate{Leader: leaderID}
+	update := desiredAssignmentUpdate{Term: leaderTerm}
 	sendMetaUpdate := func() {
 		reconcile := &streamAssignmentReconcile{Account: accName, Stream: streamName, desiredAssignmentUpdate: update}
 		s.sendInternalMsgLocked(streamAssignmentReconcileSubj, _EMPTY_, nil, reconcile)
 	}
 
 	// If desired state is missing, inform the meta leader to create desired state.
-	// Or, if the leader ID isn't ours, then get that updated first.
+	// Or, if the recorded leader term isn't ours, then get that updated first.
 	desired := sa.Group.Desired
 	if desired != nil {
 		update.ID = desired.ID
 	}
-	if desired == nil || desired.ID == _EMPTY_ || desired.Leader == _EMPTY_ || desired.Leader != leaderID {
+	if desired == nil || desired.ID == _EMPTY_ || desired.Term != leaderTerm {
 		js.mu.RUnlock()
 		sendMetaUpdate()
 		return
@@ -6859,13 +6860,11 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 	// For migration tracking.
 	var mmt *time.Timer
 	var mmtc <-chan time.Time
-	var mmLeaderID string
 
 	startMigrationMonitoring := func() {
 		if mmt == nil {
 			mmt = time.NewTimer(migrateFastCheckInterval)
 			mmtc = mmt.C
-			mmLeaderID = nuid.Next()
 		} else {
 			mmt.Reset(migrateFastCheckInterval)
 		}
@@ -6881,6 +6880,7 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 
 	// Track if we are leader.
 	var isLeader bool
+	var leaderTerm uint64
 
 	for {
 		select {
@@ -6945,7 +6945,7 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 			aq.recycle(&ces)
 
 		case lc := <-lch:
-			isLeader = lc.isLeader
+			isLeader, leaderTerm = lc.isLeader, lc.term
 			if recovering && !isLeader {
 				js.setConsumerAssignmentRecovering(ca)
 			}
@@ -6989,7 +6989,7 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 			}
 			// Reset to the slower fallback speed.
 			mmt.Reset(migrateFallbackCheckInterval)
-			js.runConsumerMigration(ca, n, mmLeaderID)
+			js.runConsumerMigration(ca, n, leaderTerm)
 
 		case <-t.C:
 			// Start forcing snapshots if they failed previously.
@@ -7000,7 +7000,7 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 }
 
 // Migrate a consumer from peer set A to peer set B. Returns true when migration is done.
-func (js *jetStream) runConsumerMigration(ca *consumerAssignment, n RaftNode, leaderID string) {
+func (js *jetStream) runConsumerMigration(ca *consumerAssignment, n RaftNode, leaderTerm uint64) {
 	ourPeerId, cc, s := n.ID(), js.cluster, js.srv
 
 	js.mu.RLock()
@@ -7020,19 +7020,19 @@ func (js *jetStream) runConsumerMigration(ca *consumerAssignment, n RaftNode, le
 
 	replicas := ca.Config.replicas(osa.Config)
 
-	update := desiredAssignmentUpdate{Leader: leaderID}
+	update := desiredAssignmentUpdate{Term: leaderTerm}
 	sendMetaUpdate := func() {
 		reconcile := &consumerAssignmentReconcile{Account: accName, Stream: streamName, Consumer: consumerName, desiredAssignmentUpdate: update}
 		s.sendInternalMsgLocked(consumerAssignmentReconcileSubj, _EMPTY_, nil, reconcile)
 	}
 
 	// If desired state is missing, inform the meta leader to create desired state.
-	// Or, if the leader ID isn't ours, then get that updated first.
+	// Or, if the recorded leader term isn't ours, then get that updated first.
 	desired := ca.Group.Desired
 	if desired != nil {
 		update.ID = desired.ID
 	}
-	if desired == nil || desired.ID == _EMPTY_ || desired.Leader == _EMPTY_ || desired.Leader != leaderID {
+	if desired == nil || desired.ID == _EMPTY_ || desired.Term != leaderTerm {
 		js.mu.RUnlock()
 		sendMetaUpdate()
 		return
@@ -7838,8 +7838,8 @@ type consumerAssignmentReconcile struct {
 }
 
 type desiredAssignmentUpdate struct {
-	ID     string `json:"id,omitempty"` // Desired state ID. Empty if there is no desired state yet.
-	Leader string `json:"leader"`       // Leader consistency ID.
+	ID   string `json:"id,omitempty"` // Desired state ID. Empty if there is no desired state yet.
+	Term uint64 `json:"term"`         // Raft term of the group leader sending this update, used for fencing.
 
 	// The below fields are mutually exclusive.
 	ScaleDownPeers []string `json:"scale_down_peers,omitempty"` // If the desired state was about scaledown, this is the selected peer set.
@@ -7865,7 +7865,7 @@ func (js *jetStream) reconcileDesiredStreamAssignment(_ *subscription, _ *client
 		return
 	}
 	osa := js.streamAssignmentOrInflight(reconcile.Account, reconcile.Stream)
-	if osa == nil || osa.Group == nil || osa.unsupported != nil || reconcile.Leader == _EMPTY_ {
+	if osa == nil || osa.Group == nil || osa.unsupported != nil || reconcile.Term == 0 {
 		return
 	}
 
@@ -7928,7 +7928,7 @@ func (js *jetStream) reconcileDesiredConsumerAssignment(_ *subscription, _ *clie
 		return
 	}
 	oca := js.consumerAssignmentOrInflight(reconcile.Account, reconcile.Stream, reconcile.Consumer)
-	if oca == nil || oca.Group == nil || oca.unsupported != nil || reconcile.Leader == _EMPTY_ {
+	if oca == nil || oca.Group == nil || oca.unsupported != nil || reconcile.Term == 0 {
 		return
 	}
 	// Sanity check that the consumer isn't trying to scale to a peer that isn't
@@ -7982,8 +7982,14 @@ func (rg *raftGroup) reconcileDesiredState(reconcile desiredAssignmentUpdate, re
 		}
 		ng.Peers = newPeers
 		ng = rg.withDesired(ng)
-		ng.Desired.Leader = reconcile.Leader
+		ng.Desired.Term = reconcile.Term
 		return ng
+	}
+
+	// Requests from an older leadership term are stale, fence them off. Raft guarantees at most
+	// one leader per term, so anything below the recorded term can't be from the current leader.
+	if reconcile.Term < rg.Desired.Term {
+		return nil
 	}
 
 	// Skip if this request is not about our latest desired state.
@@ -7991,13 +7997,13 @@ func (rg *raftGroup) reconcileDesiredState(reconcile desiredAssignmentUpdate, re
 		return nil
 	}
 
-	// Desired state is set, but the leader's ID in our desired state MUST match that of the request.
-	// The group leader waits with sending update requests until it sees its own leader ID. The desired
-	// state ID is updated to prevent the group leader from sending an update request early.
-	if rg.Desired.Leader == _EMPTY_ || rg.Desired.Leader != reconcile.Leader {
+	// Desired state is set, but a new leadership term MUST first be recorded before its updates
+	// are accepted. The group leader waits with sending update requests until it sees its own term.
+	// The desired state ID is updated to prevent the group leader from sending an update request early.
+	if rg.Desired.Term == 0 || reconcile.Term > rg.Desired.Term {
 		ng := rg.copyGroup()
 		ng.Desired.ID = nuid.Next()
-		ng.Desired.Leader = reconcile.Leader
+		ng.Desired.Term = reconcile.Term
 		return ng
 	}
 
