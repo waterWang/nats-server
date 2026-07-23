@@ -2689,7 +2689,7 @@ func (s *Server) jsLeaderServerStreamMoveRequest(sub *subscription, c *client, _
 		cfg.Placement.Tags = append(cfg.Placement.Tags, req.Tags...)
 	}
 
-	// TODO(mvv): scaffolded desired state into the move API for now, this endpoint needs to be refactored
+	// FIXME(mvv): scaffolded desired state into the move API for now, this endpoint needs to be refactored
 	peers, e := cc.selectPeerGroup(cfg.Replicas+1, currCluster, &cfg, currPeers, 1, nil)
 	if len(peers) <= cfg.Replicas {
 		// since expanding in the same cluster did not yield a result, try in different cluster
@@ -2800,7 +2800,7 @@ func (s *Server) jsLeaderServerStreamCancelMoveRequest(sub *subscription, c *cli
 		return
 	}
 
-	// TODO(mvv): scaffolded desired state into the cancel move API for now, this endpoint needs to be refactored
+	// FIXME(mvv): scaffolded desired state into the cancel move API for now, this endpoint needs to be refactored
 	if sa.Group.Desired != nil {
 		defer js.mu.Unlock()
 		origin := sa.Group.Desired.Origin

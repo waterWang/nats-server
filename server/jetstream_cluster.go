@@ -3969,7 +3969,7 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 		for _, peer := range desiredPeers {
 			if !slices.Contains(current, peer) {
 				combined = append(combined, peer)
-				// TODO(mvv): for testing only add one replica per cycle.
+				// FIXME(mvv): for testing only add one replica per cycle.
 				break
 			}
 		}
@@ -5388,6 +5388,7 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 	s, rg, desired := js.srv, sa.Group, sa.Group.Desired
 	client, subject, reply := sa.Client, sa.Subject, sa.Reply
 	alreadyRunning, numReplicas := osa.Group.node != nil, len(rg.Peers)
+	wasClustered := len(osa.Group.Peers) > 1 || osa.Group.Desired != nil
 	needsNode := rg.node == nil
 	storage, cfg := sa.Config.Storage, sa.Config
 	newCfg := cfg.atDesiredOrigin(rg)
@@ -5495,8 +5496,7 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 	isLeader := mset.IsLeader()
 
 	// If the stream is scaled down, there is a chance we weren't already the leader.
-	// FIXME(mvv): does this always run now for any single-replica stream update?
-	if isLeader && numReplicas == 1 && desired == nil {
+	if isLeader && numReplicas == 1 && desired == nil && wasClustered {
 		js.processStreamLeaderChange(mset, true, 0)
 	}
 
@@ -7113,7 +7113,7 @@ func (js *jetStream) runConsumerMigration(ca *consumerAssignment, n RaftNode, le
 			js.mu.RUnlock()
 			return
 		}
-		// TODO(mvv): for testing only add one replica per cycle.
+		// FIXME(mvv): for testing only add one replica per cycle.
 		update.MetaPeers = append(current, nextPeer)
 		js.mu.RUnlock()
 		sendMetaUpdate()
@@ -8387,7 +8387,7 @@ func (js *jetStream) remapConsumerAssignments(accName string, sa *streamAssignme
 			cca.Config = &cfg
 		}
 		// Only use desired state if the stream did as well.
-		// TODO(mvv): improve peer-remove
+		// FIXME(mvv): improve peer-remove
 		if sa.Group.Desired != nil {
 			cca.Group = ca.Group.withDesired(cca.Group)
 			// Scaled down if we kept at least one peer, but removed others.
@@ -9125,8 +9125,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 	//	s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
 	//	return
 	//}
-
-	// FIXME(mvv): can now move and scale at the same time
+	//
 	//// Can not move and scale at same time.
 	//if isMoveRequest && isReplicaChange {
 	//	resp.Error = NewJSStreamMoveAndScaleError()

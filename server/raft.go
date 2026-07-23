@@ -3778,7 +3778,7 @@ func (n *raft) trackPeer(peer string) error {
 	if ps := n.peers[peer]; ps != nil {
 		ps.ts = time.Now()
 	}
-	// TODO(mvv): if managed, could track meta assigned but not tracked peers here
+	// FIXME(mvv): if managed, could track meta assigned but not tracked peers here
 	//  that could help in preserving quorum if the meta assignment was updated but
 	//  it's not coming up on the new peer
 	n.Unlock()
