@@ -3875,6 +3875,8 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n RaftNode, leaderTerm uint64) {
 	ourPeerId, cc, s := n.ID(), js.cluster, js.srv
 
+	// FIXME(mvv): a move should make sure that peers are also upper-layer current
+	//  should peers where we're moving to, become required for quorum before we move?
 	//// Check to see where we are..
 	//rg := mset.raftGroup()
 	//
@@ -9497,11 +9499,11 @@ func (s *Server) selectScaleDownPeers(curLeader string, current []*Peer, peers [
 // remove during scale-down: peers unknown to the group first, then offline
 // peers, then online peers with the most lag. The current leader, if among the
 // candidates, is picked last so leadership is transferred at most once.
-func (s *Server) selectPeerToRemove(curLeader string, current []*Peer, peers []string) string {
-	if len(peers) == 0 {
+func (s *Server) selectPeerToRemove(curLeader string, current []*Peer, remaining []string) string {
+	if len(remaining) == 0 {
 		return _EMPTY_
 	}
-	sorted := s.sortScaleDownPeers(curLeader, current, peers)
+	sorted := s.sortScaleDownPeers(curLeader, current, remaining)
 	if len(sorted) == 0 {
 		return _EMPTY_
 	}
@@ -10410,6 +10412,7 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 		nca.Reply = reply
 		ca = nca
 	}
+
 	// Do formal proposal.
 	if err := cc.meta.Propose(cc.term, encodeAddConsumerAssignment(ca)); err != nil {
 		return
