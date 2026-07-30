@@ -80,6 +80,11 @@ type consumerInfoClusterResponse struct {
 	OfflineReason string `json:"offline_reason,omitempty"` // Reporting when a consumer is offline.
 }
 
+type consumerStateClusterResponse struct {
+	State *ConsumerState `json:"state,omitempty"`
+	Error string         `json:"error,omitempty"`
+}
+
 type PriorityGroupState struct {
 	Group          string    `json:"group"`
 	PinnedClientID string    `json:"pinned_client_id,omitempty"`
@@ -525,6 +530,7 @@ type consumer struct {
 	term      uint64 // Raft term, used to determine if we are still the leader for the current term (if applicable, 0 otherwise).
 	werr      error  // If a write error was encountered while applying entries, and if so what error.
 	infoSub   *subscription
+	stateSub  *subscription
 	lqsent    time.Time
 	prm       map[string]struct{}
 	rsm       map[string]bool // Reset requests that need to be responded to on the internal sys account (if true).
@@ -1703,6 +1709,10 @@ func (o *consumer) setLeader(isLeader bool, term uint64) error {
 		o.srv.sysUnsubscribe(o.infoSub)
 		o.infoSub = nil
 	}
+	if o.stateSub != nil {
+		o.srv.sysUnsubscribe(o.stateSub)
+		o.stateSub = nil
+	}
 	// Reset waiting if we are in pull mode.
 	if o.isPullMode() {
 		o.waiting = newWaitQueue(o.cfg.MaxWaiting)
@@ -1783,6 +1793,10 @@ func (o *consumer) setLeader(isLeader bool, term uint64) error {
 			isubj := fmt.Sprintf(clusterConsumerInfoT, jsa.acc(), stream, o.name)
 			// Note below the way we subscribe here is so that we can send requests to ourselves.
 			o.infoSub, _ = s.systemSubscribe(isubj, _EMPTY_, false, o.sysc, o.handleClusterConsumerInfoRequest)
+		}
+		if o.stateSub == nil && jsa != nil {
+			ssubj := fmt.Sprintf(clusterConsumerStateT, jsa.acc(), stream, o.name)
+			o.stateSub, _ = s.systemSubscribe(ssubj, _EMPTY_, false, o.sysc, o.handleClusterConsumerStateRequest)
 		}
 
 		var err error
@@ -1917,6 +1931,26 @@ func (o *consumer) setLeader(isLeader bool, term uint64) error {
 // This is coming on the wire so do not block here.
 func (o *consumer) handleClusterConsumerInfoRequest(sub *subscription, c *client, _ *Account, subject, reply string, msg []byte) {
 	go o.infoWithSnapAndReply(false, reply)
+}
+
+// This is coming on the wire so do not block here.
+func (o *consumer) handleClusterConsumerStateRequest(_ *subscription, _ *client, _ *Account, _, reply string, _ []byte) {
+	go func() {
+		o.mu.Lock()
+		if o.closed || o.store == nil || o.sysc == nil {
+			o.mu.Unlock()
+			return
+		}
+		state, err := o.store.State()
+		srv, sysc, acc, stream, name := o.srv, o.sysc, o.acc.Name, o.stream, o.name
+		o.mu.Unlock()
+		if err != nil {
+			srv.Warnf("JetStream consumer '%s > %s > %s' failed to get state for snapshot: %v", acc, stream, name, err)
+			sysc.sendInternalMsg(reply, _EMPTY_, nil, &consumerStateClusterResponse{Error: err.Error()})
+			return
+		}
+		sysc.sendInternalMsg(reply, _EMPTY_, nil, &consumerStateClusterResponse{State: state})
+	}()
 }
 
 // Lock should be held.
@@ -6665,6 +6699,10 @@ func (o *consumer) stopWithFlags(dflag, sdflag, doSignal, advisory bool) error {
 	if o.infoSub != nil {
 		o.srv.sysUnsubscribe(o.infoSub)
 		o.infoSub = nil
+	}
+	if o.stateSub != nil {
+		o.srv.sysUnsubscribe(o.stateSub)
+		o.stateSub = nil
 	}
 	c := o.client
 	o.client = nil

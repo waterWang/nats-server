@@ -150,55 +150,24 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 	// Do consumers first, if the stream is interest/WQ then this may be
 	// important for message retention.
 	if includeConsumers {
-		consumerStateFromInfo := func(ci *ConsumerInfo) *ConsumerState {
-			state := &ConsumerState{
-				Delivered: SequencePair{
-					Consumer: ci.Delivered.Consumer,
-					Stream:   ci.Delivered.Stream,
-				},
-				AckFloor: SequencePair{
-					Consumer: ci.AckFloor.Consumer,
-					Stream:   ci.AckFloor.Stream,
-				},
-			}
-			if ci.NumAckPending <= 0 || ci.Delivered.Stream <= ci.AckFloor.Stream || ci.Delivered.Consumer <= ci.AckFloor.Consumer {
-				return state
-			}
-
-			pending := uint64(ci.NumAckPending)
-			if maxPending := ci.Delivered.Stream - ci.AckFloor.Stream; pending > maxPending {
-				pending = maxPending
-			}
-			if maxPending := ci.Delivered.Consumer - ci.AckFloor.Consumer; pending > maxPending {
-				pending = maxPending
-			}
-			if pending == 0 {
-				return state
-			}
-
-			// Cluster consumer info does not include sparse pending details.
-			// Approximate pending with a contiguous range above the ack floor.
-			state.Pending = make(map[uint64]*Pending, int(pending))
-			ts := now.UnixNano()
-			for i := uint64(0); i < pending; i++ {
-				state.Pending[ci.AckFloor.Stream+1+i] = &Pending{
-					Sequence:  ci.AckFloor.Consumer + 1 + i,
-					Timestamp: ts,
-				}
-			}
-			return state
-		}
-
 		if clustered {
 			for _, ca := range consumerAssignments {
-				ci, err := sysRequest[ConsumerInfo](js.srv, clusterConsumerInfoT, sa.Client.serviceAccount(), sa.Config.Name, ca.Name)
-				if err != nil || ci == nil {
-					errCh <- fmt.Errorf("failed to get consumer state for '%s > %s'", sa.Config.Name, ca.Name)
+				resp, err := sysRequest[consumerStateClusterResponse](js.srv, clusterConsumerStateT, sa.Client.serviceAccount(), sa.Config.Name, ca.Name)
+				if err != nil {
+					errCh <- fmt.Errorf("failed to get consumer state for '%s > %s': %w", sa.Config.Name, ca.Name, err)
+					return
+				}
+				if resp == nil || resp.State == nil {
+					if resp != nil && resp.Error != _EMPTY_ {
+						errCh <- fmt.Errorf("failed to get consumer state for '%s > %s': %s", sa.Config.Name, ca.Name, resp.Error)
+					} else {
+						errCh <- fmt.Errorf("failed to get consumer state for '%s > %s': empty response", sa.Config.Name, ca.Name)
+					}
 					return
 				}
 				if err := writeConsumerMsg(SnapshotConsumerState{
 					ConsumerConfig: ca.Config,
-					ConsumerState:  consumerStateFromInfo(ci),
+					ConsumerState:  resp.State,
 				}); err != nil {
 					errCh <- err
 					return
@@ -225,11 +194,12 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 
 	var sm StoreMsg
 	for seq := state.FirstSeq - 1; seq < state.LastSeq; {
-		if _, seq, err = store.LoadNextMsg(fwcs, true, seq+1, &sm); err != nil {
+		target := seq + 1
+		if _, seq, err = store.LoadNextMsg(fwcs, true, target, &sm); err != nil {
 			if err == ErrStoreEOF {
 				break
 			}
-			errCh <- fmt.Errorf("couldn't load next message after seq %d: %s", seq+1, err)
+			errCh <- fmt.Errorf("couldn't load next message after seq %d: %s", target, err)
 			return
 		}
 		if err = writeStoreMsg(&sm); err != nil {

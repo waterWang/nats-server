@@ -11631,8 +11631,9 @@ func syncSubject(pre string) string {
 }
 
 const (
-	clusterStreamInfoT   = "$JSC.SI.%s.%s"
-	clusterConsumerInfoT = "$JSC.CI.%s.%s.%s"
-	jsaUpdatesSubT       = "$JSC.ARU.%s.*"
-	jsaUpdatesPubT       = "$JSC.ARU.%s.%s"
+	clusterStreamInfoT    = "$JSC.SI.%s.%s"
+	clusterConsumerInfoT  = "$JSC.CI.%s.%s.%s"
+	clusterConsumerStateT = "$JSC.CS.%s.%s.%s"
+	jsaUpdatesSubT        = "$JSC.ARU.%s.*"
+	jsaUpdatesPubT        = "$JSC.ARU.%s.%s"
 )
