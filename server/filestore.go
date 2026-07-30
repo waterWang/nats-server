@@ -12738,7 +12738,7 @@ func (fs *fileStore) ConsumerStore(name string, created time.Time, cfg *Consumer
 	// We now allow overrides from a stream being a filestore type and forcing a consumer to be memory store.
 	if cfg.MemoryStorage {
 		// Create directly here.
-		o := &consumerMemStore{ms: fs, cfg: *cfg}
+		o := &consumerMemStore{ms: fs, name: name, cfg: *cfg}
 		if err := fs.AddConsumer(o); err != nil {
 			return nil, err
 		}

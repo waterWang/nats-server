@@ -2816,6 +2816,14 @@ func TestJetStreamClusterUserSnapshotAndRestore(t *testing.T) {
 	if rresp.Error != nil {
 		t.Fatalf("Got an unexpected error response: %+v", rresp.Error)
 	}
+	pa, err := js.Publish("foo", []byte("OK"))
+	if err != nil {
+		t.Fatalf("Unexpected publish error after restore: %v", err)
+	}
+	if pa.Sequence != uint64(toSend+1) {
+		t.Fatalf("Expected sequence %d after restore, got %d", toSend+1, pa.Sequence)
+	}
+	toSend++
 
 	si, err := js.StreamInfo("TEST")
 	if err != nil {

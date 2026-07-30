@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"path"
 	"slices"
@@ -99,6 +100,21 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 	}
 
 	writeConsumerMsg := func(scs SnapshotConsumerState) error {
+		// Bound the consumer state to the stream snapshot. Consumer sequence
+		// numbers are left intact since filtered consumers do not have a
+		// one-to-one mapping between consumer and stream sequences.
+		scs.Delivered.Stream = min(scs.Delivered.Stream, state.LastSeq)
+		scs.AckFloor.Stream = min(scs.AckFloor.Stream, state.LastSeq)
+		for seq := range scs.Pending {
+			if seq > state.LastSeq {
+				delete(scs.Pending, seq)
+			}
+		}
+		for seq := range scs.Redelivered {
+			if seq > state.LastSeq {
+				delete(scs.Redelivered, seq)
+			}
+		}
 		ssj, err := json.Marshal(scs)
 		if err != nil {
 			return err
@@ -218,7 +234,7 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 }
 
 // RestoreStreamSnapshotV2 will restore a stream from a snapshot.
-func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (*stream, error) {
+func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (retMset *stream, retErr error) {
 	dec := s2.NewReader(r)
 	tr := archive.NewReader(dec)
 
@@ -279,10 +295,23 @@ func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (*stream, err
 		return nil, err
 	}
 
-	mset, err := a.addStream(&cfg)
+	mset, err := a.addStreamForRestore(&cfg)
 	if err != nil {
 		return nil, fmt.Errorf("error adding stream: %w", err)
 	}
+	defer func() {
+		var state StreamState
+		mset.store.FastState(&state)
+		mset.mu.Lock()
+		mset.lseq = state.LastSeq
+		mset.mu.Unlock()
+		if err := mset.completeRestore(); err != nil {
+			if err = fmt.Errorf("failed to activate stream %q: %w", cfg.Name, err); retErr == nil {
+				retErr = err
+			}
+			s.Warnf("JetStream stream restore for '%s > %s' failed to activate stream: %v", a.Name, cfg.Name, err)
+		}
+	}()
 
 	// Start off at the right sequence number. This is important in particular
 	// when the backup contains no messages or would restore to no interest.
@@ -290,12 +319,29 @@ func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (*stream, err
 		return nil, fmt.Errorf("error purging stream: %w", err)
 	}
 
+	var restoredConsumers, ephemerals []*consumer
+	defer func() {
+		// Consumers must be unconditionally converted and completed, otherwise
+		// a partial restore that fails midway through can leave assets that are
+		// unusable.
+		for _, o := range ephemerals {
+			o.switchToEphemeral()
+		}
+		for _, o := range restoredConsumers {
+			if err := o.completeRestore(); err != nil {
+				if err = fmt.Errorf("failed to activate consumer %q: %w", o.name, err); retErr == nil {
+					retErr = err
+				}
+				s.Warnf("JetStream stream restore for '%s > %s' failed to activate consumers: %v", a.Name, cfg.Name, err)
+			}
+		}
+	}()
 	for range nstate.Consumers {
 		hdr, err := tr.Next()
 		if err != nil {
 			return nil, err
 		}
-		bc += hdr.HeaderSize + hdr.PayloadSize
+		bc = addSaturate(bc, hdr.HeaderSize+hdr.PayloadSize)
 		js.mu.RLock()
 		err = js.checkAllLimits(&selected, tier, &cfg, reserved, bc)
 		js.mu.RUnlock()
@@ -314,10 +360,26 @@ func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (*stream, err
 		if err := json.Unmarshal(buf, &consumer); err != nil {
 			return nil, fmt.Errorf("failed to decode consumer %q state: %w", name, err)
 		}
-		o, err := mset.addConsumer(consumer.ConsumerConfig)
+		if consumer.ConsumerConfig == nil {
+			return nil, fmt.Errorf("consumer %q is missing config", name)
+		}
+		if consumer.ConsumerState == nil {
+			return nil, fmt.Errorf("consumer %q is missing state", name)
+		}
+		isEphemeral := !isDurableConsumer(consumer.ConsumerConfig)
+		if isEphemeral {
+			// Keep ephemerals alive and interested until all messages have
+			// been restored, then start their normal inactivity lifecycle.
+			consumer.Durable = name
+		}
+		o, err := mset.addConsumerForRestore(consumer.ConsumerConfig)
 		if err != nil {
 			return nil, fmt.Errorf("failed to add consumer %q: %w", name, err)
 		}
+		if isEphemeral {
+			ephemerals = append(ephemerals, o)
+		}
+		restoredConsumers = append(restoredConsumers, o)
 		o.mu.Lock()
 		err = o.setStoreState(consumer.ConsumerState)
 		o.mu.Unlock()
@@ -329,6 +391,7 @@ func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (*stream, err
 	store := mset.store
 	lseq := nstate.FirstSeq - 1
 	eob := false
+	mp := int64(s.getOpts().MaxPayload)
 	for {
 		hdr, err := tr.Next()
 		if err != nil {
@@ -343,8 +406,27 @@ func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (*stream, err
 			}
 			return nil, fmt.Errorf("expected message sequence")
 		}
-		if hdr.HeaderSize < 0 || hdr.PayloadSize < 0 {
+		if hdr.HeaderSize < 0 || hdr.PayloadSize < 0 || hdr.PayloadSize > math.MaxInt64-hdr.HeaderSize {
 			return nil, fmt.Errorf("invalid message lengths for sequence %d", seq)
+		}
+		declaredSize := hdr.HeaderSize + hdr.PayloadSize
+		if hdr.HeaderSize > mp || hdr.PayloadSize > mp-hdr.HeaderSize {
+			return nil, fmt.Errorf("message sequence %d exceeds maximum payload size", seq)
+		}
+		if mms := int64(cfg.MaxMsgSize); mms >= 0 && (hdr.HeaderSize > mms || hdr.PayloadSize > mms-hdr.HeaderSize) {
+			return nil, fmt.Errorf("message sequence %d exceeds maximum message size", seq)
+		}
+		switch cfg.Storage {
+		case MemoryStorage:
+			bc = addSaturate(bc, int64(memStoreMsgSizeRaw(len(hdr.Name), int(hdr.HeaderSize), int(hdr.PayloadSize))))
+		default:
+			bc = addSaturate(bc, int64(fileStoreMsgSizeRaw(len(hdr.Name), int(hdr.HeaderSize), int(hdr.PayloadSize))))
+		}
+		js.mu.RLock()
+		err = js.checkAllLimits(&selected, tier, &cfg, reserved, bc)
+		js.mu.RUnlock()
+		if err != nil {
+			return nil, err
 		}
 		buf, err := io.ReadAll(tr)
 		if err != nil {
@@ -353,7 +435,7 @@ func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (*stream, err
 		if hdr.HeaderSize > int64(len(buf)) {
 			return nil, fmt.Errorf("failed to parse message sequence %d: invalid header length", seq)
 		}
-		if int64(len(buf)) != hdr.HeaderSize+hdr.PayloadSize {
+		if int64(len(buf)) != declaredSize {
 			return nil, fmt.Errorf("failed to read message sequence %d: unexpected payload size", seq)
 		}
 		subj := hdr.Name
@@ -370,18 +452,6 @@ func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (*stream, err
 			}
 		}
 		lseq = seq
-		switch cfg.Storage {
-		case MemoryStorage:
-			bc += int64(memStoreMsgSize(subj, mhdr, msg))
-		default:
-			bc += int64(fileStoreMsgSize(subj, mhdr, msg))
-		}
-		js.mu.RLock()
-		err = js.checkAllLimits(&selected, tier, &cfg, reserved, bc)
-		js.mu.RUnlock()
-		if err != nil {
-			return nil, err
-		}
 		ttl, err := getMessageTTL(mhdr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse message TTL: %w", err)
