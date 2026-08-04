@@ -500,6 +500,59 @@ func TestNRGSwitchStateClearsQueues(t *testing.T) {
 	require_Equal(t, n.resp.len(), 0)
 }
 
+func TestNRGSwitchStateWaitsForFastPathProposal(t *testing.T) {
+	s := &Server{}
+
+	n := &raft{
+		prop:  newIPQueue[*proposedEntry](s, "prop"),
+		resp:  newIPQueue[*appendEntryResponse](s, "resp"),
+		leadc: make(chan leadChange, 1),
+		sd:    t.TempDir(),
+		dios:  defaultDiskIOSemaphore(),
+		term:  1,
+	}
+
+	// Simulate the leader opening the fast path
+	n.state.Store(int32(Leader))
+	n.openProposalFastPath()
+
+	// Hold the fast path lock to simulate a proposer that has passed the
+	// leader and term checks but has not enqueued its proposal yet.
+	n.fp.Lock()
+
+	// Simulate leader that switches to follower while fast path is open
+	switched := make(chan struct{})
+	go func() {
+		n.Lock()
+		n.switchState(Follower)
+		n.Unlock()
+		close(switched)
+	}()
+
+	// The state transition must wait for the fast path proposer before
+	// draining the proposal queue
+	select {
+	case <-switched:
+		n.fp.Unlock()
+		t.Fatal("switchState to follower completed with a fast path proposal active")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Finish the fast path proposal
+	n.prop.push(newProposedEntry(
+		newEntry(EntryNormal, []byte("must be drained")), _EMPTY_))
+	n.fp.Unlock()
+
+	// The transition completes, the proposed entry is drained,
+	// and the fast path is closed.
+	require_ChanRead(t, switched, time.Second)
+	require_Equal(t, n.State(), Follower)
+	require_Equal(t, n.prop.len(), 0)
+	n.fp.Lock()
+	require_False(t, n.fp.open)
+	n.fp.Unlock()
+}
+
 func TestNRGStepDownOnSameTermDoesntClearVote(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
