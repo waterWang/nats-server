@@ -189,7 +189,7 @@ type fileStore struct {
 	syncMu      sync.Mutex // Serializes background and explicit block syncs.
 	cfg         FileStreamInfo
 	fcfg        FileStoreConfig
-	syncAlways  atomic.Bool // Mirrors FileStoreConfig.SyncAlways for lock-free reads from writeFileWithOptionalSync.
+	syncAlways  atomic.Bool // Effective SyncAlways behavior for lock-free reads.
 	syncOnFlush atomic.Bool // Effective sync on flush behavior. True only if SyncAlways and replicas > 1.
 	prf         keyGen
 	oldprf      keyGen
@@ -266,7 +266,6 @@ type msgBlock struct {
 	noTrack     bool
 	needSync    bool
 	needKeySync bool // Key file is written once and immutable, cleared after its one sync.
-	syncAlways  bool
 	noCompact   bool
 	closed      bool
 	ttls        uint64 // How many msgs have TTLs?
@@ -793,13 +792,6 @@ func (fs *fileStore) UpdateConfig(cfg *StreamConfig) error {
 			supportsAsyncFlush = true
 			fs.fcfg.SyncAlways = false
 			fs.syncAlways.Store(false)
-			lmb.mu.Lock()
-			lmb.syncAlways = false
-			lmb.mu.Unlock()
-		} else {
-			lmb.mu.Lock()
-			lmb.syncAlways = fs.syncAlways.Load()
-			lmb.mu.Unlock()
 		}
 
 		if supportsAsyncFlush && !fs.fcfg.AsyncFlush {
@@ -1150,12 +1142,11 @@ func (fs *fileStore) noTrackSubjects() bool {
 // Will init the basics for a message block.
 func (fs *fileStore) initMsgBlock(index uint32) *msgBlock {
 	mb := &msgBlock{
-		fs:         fs,
-		index:      index,
-		cexp:       fs.fcfg.CacheExpire,
-		fexp:       fs.fcfg.SubjectStateExpire,
-		noTrack:    fs.noTrackSubjects(),
-		syncAlways: fs.syncAlways.Load(),
+		fs:      fs,
+		index:   index,
+		cexp:    fs.fcfg.CacheExpire,
+		fexp:    fs.fcfg.SubjectStateExpire,
+		noTrack: fs.noTrackSubjects(),
 	}
 
 	mdir := filepath.Join(fs.fcfg.StoreDir, msgDir)
@@ -8464,7 +8455,7 @@ func (mb *msgBlock) flushPendingMsgsLocked() (*LostStreamData, error) {
 	mb.cache.wp = int(wp)
 
 	// Check if we are in sync always mode.
-	if mb.syncAlways {
+	if mb.fs.syncAlways.Load() {
 		if err = mb.mfd.Sync(); err != nil {
 			mb.werr = err
 			assert.Unreachable("Filestore msg block encountered sync error", map[string]any{
