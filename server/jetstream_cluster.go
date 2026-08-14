@@ -205,7 +205,12 @@ type desiredRaftGroup struct {
 	Cluster   string   `json:"cluster,omitempty"`
 	Preferred string   `json:"preferred,omitempty"`
 
+	// ScaleDown marks this desired state as a scale down. The Peers field is the
+	// total set that can be scaled down from.
 	ScaleDown bool `json:"scale_down,omitempty"`
+
+	// Move marks this desired state as retargeting placement.
+	Move bool `json:"move,omitempty"`
 
 	// Removed are peers an operator peer-removed from this group. A group that
 	// can't reach quorum may only evict what's recorded here.
@@ -250,6 +255,27 @@ func (sa *streamAssignment) legacyMoveOrigin() *desiredRaftGroupOrigin {
 	}
 }
 
+// desiredOrigin returns the origin to roll back to, either recorded on the desired
+// state or reconstructed from a legacy move. Nil if there's nothing to roll back to.
+func (sa *streamAssignment) desiredOrigin() *desiredRaftGroupOrigin {
+	if sa == nil || sa.Group == nil {
+		return nil
+	}
+	if sa.Group.Desired != nil {
+		return sa.Group.Desired.Origin
+	}
+	return sa.legacyMoveOrigin()
+}
+
+// moveInFlight returns whether a move is still converging, including one that was
+// started before the upgrade to desired state.
+func (sa *streamAssignment) moveInFlight() bool {
+	if sa == nil || sa.Group == nil {
+		return false
+	}
+	return (sa.Group.Desired != nil && sa.Group.Desired.Move) || sa.legacyMoveOrigin() != nil
+}
+
 // withDesired returns a copy of rg with target expressed as the desired state.
 // target MUST already be a copy or fresh group, as it's directly referenced.
 func (rg *raftGroup) withDesired(target *raftGroup) *raftGroup {
@@ -274,6 +300,8 @@ func (rg *raftGroup) withDesired(target *raftGroup) *raftGroup {
 		Preferred: target.Preferred,
 	}
 	if rg.Desired != nil {
+		// Must preserve whether an in-flight move is being retargeted.
+		ng.Desired.Move = rg.Desired.Move
 		// Must preserve the prior origin (if any).
 		if rg.Desired.Origin != nil {
 			origin := *rg.Desired.Origin
@@ -381,6 +409,10 @@ func (rg *raftGroup) withRetentionChange(osa *streamAssignment, newRetention Ret
 		}
 		// Must always register desired state.
 		rg = osa.Group.withDesired(rg)
+		// A legacy move absorbed into desired state must keep counting as a move in flight.
+		if osa.legacyMoveOrigin() != nil {
+			rg.Desired.Move = true
+		}
 	}
 	// Desired state MUST always have an origin recorded, or it can't be rolled back or canceled.
 	rg.populateOrigin(osa)
@@ -8602,12 +8634,16 @@ func (rg *raftGroup) reconcileDesiredState(reconcile desiredAssignmentUpdate, re
 		}
 		ng := rg.copyGroup()
 		newPeers := rg.Peers
-		if len(newPeers) > replicas {
+		// An over-replicated peer set is a legacy move being converted into
+		// desired state, it must keep counting as a move in flight.
+		legacyMove := len(newPeers) > replicas
+		if legacyMove {
 			newPeers = newPeers[len(newPeers)-replicas:]
 		}
 		ng.Peers = newPeers
 		ng = rg.withDesired(ng)
 		ng.Desired.Term = reconcile.Term
+		ng.Desired.Move = legacyMove
 		return ng
 	}
 
@@ -9044,6 +9080,9 @@ func (cc *jetStreamCluster) reassignStreamPeers(sa *streamAssignment, peers []st
 	// Preserve how the group is meant to converge.
 	if d := sa.Group.Desired; d != nil {
 		csa.Group.Desired.ScaleDown = d.ScaleDown
+	} else if sa.legacyMoveOrigin() != nil {
+		// A legacy move absorbed into desired state must keep counting as a move in flight.
+		csa.Group.Desired.Move = true
 	}
 	if remove {
 		removeFrom := func(from []string) []string {
@@ -9818,6 +9857,53 @@ func (s *Server) jsClusteredStreamRequest(ci *ClientInfo, acc *Account, subject,
 	cc.trackInflightStreamProposal(acc.Name, sa, false)
 }
 
+// jsClusteredStreamCancelMoveLocked proposes a rollback of the stream's in-flight desired
+// state to its recorded origin. The caller MUST have verified an origin exists, via
+// desiredOrigin. The client is responded to once the rollback proposal applies.
+// Lock should be held.
+func (s *Server) jsClusteredStreamCancelMoveLocked(osa *streamAssignment, accName, reply string) {
+	js, cc := s.getJetStreamCluster()
+	if js == nil || cc == nil || cc.meta == nil {
+		return
+	}
+	origin := osa.desiredOrigin()
+	if origin == nil {
+		return
+	}
+	// A rollback of a move still counts as a move in flight, it must keep blocking other
+	// moves and scales until it completes. Must capture before the group is retargeted.
+	moveInFlight := osa.moveInFlight()
+
+	csa := osa.copyGroup()
+	// Need to respond to the client that cancels.
+	csa.Reply = reply
+	// Revert replicas and placement in the config immediately.
+	csa.Config = osa.Config.clone()
+	csa.Config.Replicas = origin.Replicas
+	csa.Config.Placement = origin.Placement.clone()
+	if origin.Retention != nil {
+		csa.Config.Retention = *origin.Retention
+	}
+	// Move back to the initial peer set via desired state.
+	csa.Group.Peers = copyStrings(origin.Peers)
+	csa.Group.Cluster = origin.Cluster
+	csa.Group = osa.Group.withDesired(csa.Group)
+	csa.Group.Desired.Move = moveInFlight
+	// withDesired only carries over a prior origin, a legacy move has none yet.
+	// Record it, so the rollback reports the same target while it converges.
+	if csa.Group.Desired.Origin == nil {
+		csa.Group.Desired.Origin = origin
+	}
+
+	s.Noticef("Requested cancel of move: R=%d '%s > %s' and restore previous peer set %+v",
+		origin.Replicas, accName, csa.Config.Name, s.peerSetToNames(origin.Peers))
+
+	if err := cc.meta.Propose(cc.term, encodeUpdateStreamAssignment(csa)); err != nil {
+		return
+	}
+	cc.trackInflightStreamProposal(accName, csa, false)
+}
+
 func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, subject, reply string, rmsg []byte, cfg *StreamConfig, pedantic bool) {
 	js := s.getJetStream()
 	if js == nil {
@@ -9925,11 +10011,46 @@ func (s *Server) jsClusteredStreamUpdateRequestLocked(ci *ClientInfo, acc *Accou
 	// Check for replica changes.
 	isReplicaChange := newCfg.Replicas != osa.Config.Replicas
 
-	// A move or scale retargets the desired peer set, so only one can be inflight at a time.
-	// Otherwise, peers of the abandoned target could accumulate in the assignment unbounded.
+	moveInFlight := osa.moveInFlight()
+	origin := osa.desiredOrigin()
+
+	// An update that reverts the placement to the origin's placement cancels the in-flight
+	// move. Detected separately from isMoveRequest, since reverting to a stream that had no
+	// placement means submitting no placement at all. Only for user updates, a server-driven
+	// move passes an explicit peer set and never changes the configured placement.
+	isPlacementRevert := len(peerSet) == 0 && moveInFlight && origin != nil &&
+		!reflect.DeepEqual(newCfg.Placement, osa.Config.Placement) &&
+		reflect.DeepEqual(newCfg.Placement, origin.Placement)
+	if isPlacementRevert && (!isReplicaChange || newCfg.Replicas == origin.Replicas) {
+		s.jsClusteredStreamCancelMoveLocked(osa, acc.Name, reply)
+		return
+	}
+
+	// Combining a move and a scale in a single update is not allowed.
+	if isMoveRequest && isReplicaChange {
+		resp.Error = NewJSStreamMoveAndScaleError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
+		return
+	}
+
+	// A move retargets the desired peer set, so only one can be inflight at a time.
+	// Otherwise, peers of the abandoned target could accumulate in the assignment
+	// unbounded. A move can't combine with an inflight scale across requests either.
 	// A legacy move counts as well, it is inflight but not expressed as desired state yet.
-	// A retention change is allowed, it does not adjust the peer set.
-	if (isMoveRequest || isReplicaChange) && (osa.Group.Desired != nil || osa.legacyMoveOrigin() != nil) {
+	if isMoveRequest {
+		if moveInFlight {
+			resp.Error = NewJSStreamMoveInProgressError()
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
+			return
+		}
+		if osa.Group.Desired != nil {
+			resp.Error = NewJSStreamScaleInProgressError()
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
+			return
+		}
+	} else if isReplicaChange && moveInFlight {
+		// A scale can't combine with an inflight move either. Scales may freely stack
+		// onto an inflight scale or retention change, but not with a move.
 		resp.Error = NewJSStreamMoveInProgressError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
 		return
@@ -9964,6 +10085,7 @@ func (s *Server) jsClusteredStreamUpdateRequestLocked(ci *ClientInfo, acc *Accou
 			rg.Cluster = peerSetCluster
 		}
 		rg = osa.Group.withDesired(rg)
+		rg.Desired.Move = true
 	} else if isReplicaChange {
 		currentPeers := rg.Peers
 		if osa.Group.Desired != nil {

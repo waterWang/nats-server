@@ -626,6 +626,9 @@ const (
 	// JSStreamRollupFailedF Generic stream rollup failure error string ({err})
 	JSStreamRollupFailedF ErrorIdentifier = 10111
 
+	// JSStreamScaleInProgressErr stream scale already in progress
+	JSStreamScaleInProgressErr ErrorIdentifier = 10226
+
 	// JSStreamSealedErr invalid operation on sealed stream
 	JSStreamSealedErr ErrorIdentifier = 10109
 
@@ -887,6 +890,7 @@ var (
 		JSStreamReplicasNotUpdatableErr:              {Code: 400, ErrCode: 10061, Description: "Replicas configuration can not be updated"},
 		JSStreamRestoreErrF:                          {Code: 500, ErrCode: 10062, Description: "restore failed: {err}"},
 		JSStreamRollupFailedF:                        {Code: 500, ErrCode: 10111, Description: "{err}"},
+		JSStreamScaleInProgressErr:                   {Code: 400, ErrCode: 10226, Description: "stream scale already in progress"},
 		JSStreamSealedErr:                            {Code: 400, ErrCode: 10109, Description: "invalid operation on sealed stream"},
 		JSStreamSequenceNotMatchErr:                  {Code: 503, ErrCode: 10063, Description: "expected stream sequence does not match"},
 		JSStreamSnapshotErrF:                         {Code: 500, ErrCode: 10064, Description: "snapshot failed: {err}"},
@@ -3249,6 +3253,16 @@ func NewJSStreamRollupFailedError(err error, opts ...ErrorOption) *ApiError {
 		ErrCode:     e.ErrCode,
 		Description: strings.NewReplacer(args...).Replace(e.Description),
 	}
+}
+
+// NewJSStreamScaleInProgressError creates a new JSStreamScaleInProgressErr error: "stream scale already in progress"
+func NewJSStreamScaleInProgressError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSStreamScaleInProgressErr]
 }
 
 // NewJSStreamSealedError creates a new JSStreamSealedErr error: "invalid operation on sealed stream"

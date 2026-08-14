@@ -2238,5 +2238,15 @@
     "help": "",
     "url": "",
     "deprecates": ""
+  },
+  {
+    "constant": "JSStreamScaleInProgressErr",
+    "code": 400,
+    "error_code": 10226,
+    "description": "stream scale already in progress",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
   }
 ]

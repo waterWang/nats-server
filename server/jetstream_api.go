@@ -3023,48 +3023,15 @@ func (s *Server) jsLeaderServerStreamCancelMoveRequest(sub *subscription, c *cli
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
-	var origin *desiredRaftGroupOrigin
-	if osa.Group.Desired != nil {
-		origin = osa.Group.Desired.Origin
-	} else {
-		// A move started before the upgrade to desired state must stay cancellable,
-		// reconstruct the origin if it's a legacy move.
-		origin = osa.legacyMoveOrigin()
-	}
-	// A group that has no desired state or origin, so no move in progress.
-	if origin == nil {
+	// A group that has no desired state or origin has no move in progress.
+	// A move started before the upgrade to desired state must stay cancellable,
+	// desiredOrigin reconstructs the origin if it's a legacy move.
+	if osa.desiredOrigin() == nil {
 		resp.Error = NewJSStreamMoveNotInProgressError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
-
-	csa := osa.copyGroup()
-	// Need to respond to the client that cancels.
-	csa.Reply = reply
-	// Revert replicas and placement in the config immediately.
-	csa.Config = osa.Config.clone()
-	csa.Config.Replicas = origin.Replicas
-	csa.Config.Placement = origin.Placement.clone()
-	if origin.Retention != nil {
-		csa.Config.Retention = *origin.Retention
-	}
-	// Move back to the initial peer set via desired state.
-	csa.Group.Peers = copyStrings(origin.Peers)
-	csa.Group.Cluster = origin.Cluster
-	csa.Group = osa.Group.withDesired(csa.Group)
-	// withDesired only carries over a prior origin, a legacy move has none yet.
-	// Record it, so the rollback reports the same target while it converges.
-	if csa.Group.Desired.Origin == nil {
-		csa.Group.Desired.Origin = origin
-	}
-
-	s.Noticef("Requested cancel of move: R=%d '%s > %s' and restore previous peer set %+v",
-		origin.Replicas, accName, streamName, s.peerSetToNames(origin.Peers))
-
-	if err = cc.meta.Propose(cc.term, encodeUpdateStreamAssignment(csa)); err != nil {
-		return
-	}
-	cc.trackInflightStreamProposal(accName, csa, false)
+	s.jsClusteredStreamCancelMoveLocked(osa, accName, reply)
 }
 
 // Request to have an account purged
