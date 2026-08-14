@@ -54,6 +54,12 @@ type jetStreamCluster struct {
 	// a response but they need to be same group, peers etc. and sync subjects.
 	inflightStreams   map[string]map[string]*inflightStreamInfo
 	inflightConsumers map[string]map[string]map[string]*inflightConsumerInfo
+	// Net change the inflight proposals above will make to the system-wide asset
+	// totals once they apply. Added to jetStream.totalStreams/totalConsumers when
+	// enforcing the system-wide limits, so concurrent creates can't all be admitted
+	// while their proposals are still in flight.
+	pendingStreams   int32
+	pendingConsumers int32
 	// Tracks raft groups currently being started by createRaftGroup, so that
 	// concurrent callers for the same group can wait without holding js.mu
 	// across the disk I/O performed during startup.
@@ -108,6 +114,7 @@ type jetStreamCluster struct {
 type inflightStreamInfo struct {
 	ops     uint64 // Inflight operations, i.e. inflight stream creates/updates/deletes.
 	deleted bool   // Whether the stream has been deleted.
+	counted int32  // What this proposal contributes to jetStreamCluster.pendingStreams.
 	*streamAssignment
 }
 
@@ -115,6 +122,7 @@ type inflightStreamInfo struct {
 type inflightConsumerInfo struct {
 	ops     uint64 // Inflight operations, i.e. inflight consumer creates/updates/deletes.
 	deleted bool   // Whether the consumer has been deleted.
+	counted int32  // What this proposal contributes to jetStreamCluster.pendingConsumers.
 	*consumerAssignment
 }
 
@@ -1593,13 +1601,33 @@ func (cc *jetStreamCluster) trackInflightStreamProposal(accName string, sa *stre
 		streams = make(map[string]*inflightStreamInfo)
 		cc.inflightStreams[accName] = streams
 	}
+	// What this proposal will do to the applied total once it lands. Recorded on the
+	// entry rather than recomputed later, since the applied state can change in between.
+	counted := inflightAssetDelta(cc.streams[accName][sa.Config.Name] != nil, deleted)
 	if inflight, ok := streams[sa.Config.Name]; ok {
 		inflight.ops++
 		inflight.deleted = deleted
 		inflight.streamAssignment = sa
+		cc.pendingStreams += counted - inflight.counted
+		inflight.counted = counted
 	} else {
-		streams[sa.Config.Name] = &inflightStreamInfo{1, deleted, sa}
+		streams[sa.Config.Name] = &inflightStreamInfo{1, deleted, counted, sa}
+		cc.pendingStreams += counted
 	}
+}
+
+// inflightAssetDelta returns how much an inflight proposal will change the applied
+// asset total once it applies, given whether the asset is currently applied and
+// whether the proposal deletes it.
+func inflightAssetDelta(applied, deleted bool) int32 {
+	switch {
+	case deleted && applied:
+		return -1
+	case !deleted && !applied:
+		return 1
+	}
+	// A delete of something we don't have, or an update of something we do.
+	return 0
 }
 
 // Remove the stream `streamName` for the account `accName` from the inflight proposals map.
@@ -1615,6 +1643,7 @@ func (cc *jetStreamCluster) removeInflightStreamProposal(accName, streamName str
 		inflight.ops--
 	} else {
 		// No pending operations left, clean up.
+		cc.pendingStreams -= inflight.counted
 		delete(streams, streamName)
 		if len(streams) == 0 {
 			delete(cc.inflightStreams, accName)
@@ -1639,12 +1668,24 @@ func (cc *jetStreamCluster) trackInflightConsumerProposal(accName, streamName st
 		consumers = make(map[string]*inflightConsumerInfo)
 		streams[streamName] = consumers
 	}
+	// Only consumers that count toward the totals contribute, see limitable.
+	var counted int32
+	if ca.limitable() {
+		var applied bool
+		if sa := cc.streams[accName][streamName]; sa != nil {
+			applied = sa.consumers[ca.Name] != nil
+		}
+		counted = inflightAssetDelta(applied, deleted)
+	}
 	if inflight, ok := consumers[ca.Name]; ok {
 		inflight.ops++
 		inflight.deleted = deleted
 		inflight.consumerAssignment = ca
+		cc.pendingConsumers += counted - inflight.counted
+		inflight.counted = counted
 	} else {
-		consumers[ca.Name] = &inflightConsumerInfo{1, deleted, ca}
+		consumers[ca.Name] = &inflightConsumerInfo{1, deleted, counted, ca}
+		cc.pendingConsumers += counted
 	}
 }
 
@@ -1663,6 +1704,7 @@ func (cc *jetStreamCluster) removeInflightConsumerProposal(accName, streamName, 
 		inflight.ops--
 	} else {
 		// No pending operations left, clean up.
+		cc.pendingConsumers -= inflight.counted
 		delete(consumers, consumerName)
 		if len(consumers) == 0 {
 			delete(streams, streamName)
@@ -9039,6 +9081,8 @@ func (js *jetStream) processLeaderChange(isLeader bool, term uint64) {
 	// Clear inflight proposal tracking.
 	js.cluster.inflightStreams = nil
 	js.cluster.inflightConsumers = nil
+	js.cluster.pendingStreams = 0
+	js.cluster.pendingConsumers = 0
 
 	if isLeader {
 		if meta := js.cluster.meta; meta != nil && meta.IsObserver() {
@@ -9897,12 +9941,11 @@ func (js *jetStream) jsClusteredStreamLimitsCheck(acc *Account, cfg *StreamConfi
 	// Don't count the stream toward the limit if it already exists (idempotent update).
 	if maxStreams := js.srv.getOpts().JetStreamLimits.MaxStreamsTotal; maxStreams > 0 &&
 		(cfg == nil || js.streamAssignmentOrInflight(acc.Name, cfg.Name) == nil) {
-		// TODO(mvv): can optimize and use js.totalStreams once no meta.ForwardProposal calls exist
-		var total int
-		for range js.streamAssignmentsOrInflightSeqAllAccounts() {
-			total++
+		var pending int32
+		if cc := js.cluster; cc != nil {
+			pending = cc.pendingStreams
 		}
-		if total >= maxStreams {
+		if int(js.totalStreams+pending) >= maxStreams {
 			return NewJSMaximumStreamsLimitError()
 		}
 	}
@@ -11185,19 +11228,7 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 		if maxConsumers := s.getOpts().JetStreamLimits.MaxConsumersTotal; maxConsumers > 0 && !cfg.Direct && !cfg.Sourcing {
 			// Don't block idempotent updates of an existing consumer.
 			if oname == _EMPTY_ || js.consumerAssignmentOrInflight(acc.Name, stream, oname) == nil {
-				// TODO(mvv): can optimize and use js.totalConsumers once no meta.ForwardProposal calls exist
-				var total int
-				for accName, sa := range js.streamAssignmentsOrInflightSeqAllAccounts() {
-					if sa.Config == nil {
-						continue
-					}
-					for ca := range js.consumerAssignmentsOrInflightSeq(accName, sa.Config.Name) {
-						if ca.Config != nil && !ca.Config.Direct && !ca.Config.Sourcing {
-							total++
-						}
-					}
-				}
-				if total >= maxConsumers {
+				if int(js.totalConsumers+cc.pendingConsumers) >= maxConsumers {
 					resp.Error = NewJSMaximumConsumersLimitError()
 					s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 					return
