@@ -385,6 +385,16 @@ type DesiredClusterInfo struct {
 	Name     string                    `json:"name,omitempty"`
 	Replicas []*PeerInfo               `json:"replicas,omitempty"`
 	Origin   *DesiredClusterInfoOrigin `json:"origin,omitempty"`
+
+	// Status is a short status line describing what the group leader is currently
+	// doing to move this group toward its desired state, or what it's waiting on.
+	Status string `json:"status,omitempty"`
+	// StatusType classifies Status by what has to change for the migration to
+	// advance, so it can be matched on without parsing the status line.
+	StatusType string `json:"status_type,omitempty"`
+	// StatusErr is the underlying failure behind Status, if it had one. Only set
+	// for faults that persist across cycles, never for races that resolve themselves.
+	StatusErr string `json:"status_err,omitempty"`
 }
 
 type DesiredClusterInfoOrigin struct {

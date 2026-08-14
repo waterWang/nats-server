@@ -192,6 +192,72 @@ type raftGroup struct {
 	Desired *desiredRaftGroup `json:"desired,omitempty"`
 	// Internal
 	node RaftNode
+	// migration reports what the group leader is currently doing to move this group
+	// toward its desired state. Local to the group leader and not replicated: only
+	// the leader drives the migration, and only the leader answers INFO requests.
+	migration migrationStatus
+}
+
+// migrationStatusType classifies a migration status by what has to change for the
+// migration to advance, so it can be matched on without parsing the status line.
+type migrationStatusType string
+
+const (
+	// The meta leader must record or advance desired state.
+	migrationStatusMeta migrationStatusType = "meta"
+	// A proposed membership change must commit.
+	migrationStatusMembership migrationStatusType = "membership"
+	// A snapshot must be installed.
+	migrationStatusSnapshot migrationStatusType = "snapshot"
+	// Peers must become store-current.
+	migrationStatusCatchup migrationStatusType = "catchup"
+	// More peers must come online before we can act without losing quorum.
+	migrationStatusQuorum migrationStatusType = "quorum"
+	// Another asset must move first, i.e. the stream/consumer ordering constraint.
+	migrationStatusBlocked migrationStatusType = "blocked"
+	// Nothing to do here, we're shutting down, or the assignment is gone.
+	migrationStatusUnavailable migrationStatusType = "unavailable"
+)
+
+// migrationStatus is what a migration cycle reports back about itself. A zero value
+// means there's nothing to report, either because we converged or because we're not
+// the group leader.
+type migrationStatus struct {
+	Type migrationStatusType
+	Line string
+	// Err is the underlying failure for the status, if it had one. Only set for
+	// faults that persist across cycles, never for races that resolve themselves.
+	Err error
+}
+
+// isSet reports whether there's anything to report, which for the shared migration
+// steps also means they acted and the migration must wait for the next cycle.
+func (m migrationStatus) isSet() bool {
+	return m.Line != _EMPTY_
+}
+
+// mstat builds a migration status of the given type. The line is a short, stable
+// phrase; keep it matchable by leaving anything unbounded to Err.
+func mstat(t migrationStatusType, format string, args ...any) migrationStatus {
+	if len(args) == 0 {
+		return migrationStatus{Type: t, Line: format}
+	}
+	return migrationStatus{Type: t, Line: fmt.Sprintf(format, args...)}
+}
+
+// withErr attaches the underlying failure, unless it's one that resolves itself on
+// the next cycle. Those would flap in and out of stream info for no good reason.
+func (m migrationStatus) withErr(err error) migrationStatus {
+	if err == nil ||
+		errors.Is(err, ErrStoreClosed) ||
+		errors.Is(err, errNotLeader) ||
+		errors.Is(err, errNodeClosed) ||
+		errors.Is(err, errMembershipChange) ||
+		errors.Is(err, errNoSnapAvailable) {
+		return m
+	}
+	m.Err = err
+	return m
 }
 
 // desiredGroupPlacement specifies the desired peer set.
@@ -3866,6 +3932,8 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 			mmt.Stop()
 			mmt, mmtc = nil, nil
 		}
+		// Don't leave a stale status behind for a migration that's done or abandoned.
+		js.setMigrationStatus(mset.raftGroup(), migrationStatus{})
 	}
 	defer stopMigrationMonitoring()
 
@@ -4184,7 +4252,9 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 			}
 			// Reset to the slower fallback speed.
 			resetMigrationMonitoring(migrateFallbackCheckInterval)
-			js.runStreamMigration(mset, sa, n, leaderTerm)
+			// Write the status through the live group, so it lands where clusterInfo
+			// reads it even if the assignment was swapped since our last update.
+			js.setMigrationStatus(mset.raftGroup(), js.runStreamMigration(mset, sa, n, leaderTerm))
 
 		case err := <-restoreDoneCh:
 			// We have completed a restore from snapshot on this server. The stream assignment has
@@ -4338,8 +4408,8 @@ func peerIDs(peers []*Peer) []string {
 // longer part of the meta group, it has been evicted from the cluster, e.g. by a
 // server peer-remove. It can't take part in a migration, so remove it from the
 // group right away rather than waiting for the rest of the migration to complete.
-// Returns true if we've acted, and the migration must wait for the next cycle.
-func (s *Server) removeEvictedPeers(n, meta RaftNode, actual []*Peer, actualPeers, current, desiredPeers []string) bool {
+// Returns a status if we've acted, and the migration must wait for the next cycle.
+func (s *Server) removeEvictedPeers(n, meta RaftNode, actual []*Peer, actualPeers, current, desiredPeers []string) migrationStatus {
 	metaPeers := meta.PeerNames()
 	var evicted []string
 	for _, peer := range actualPeers {
@@ -4348,24 +4418,25 @@ func (s *Server) removeEvictedPeers(n, meta RaftNode, actual []*Peer, actualPeer
 		}
 	}
 	if len(evicted) == 0 {
-		return false
+		return migrationStatus{}
 	}
 	// Remove evicted peers one at a time, the leader last so leadership stays
 	// stable throughout. Step down and perform a leader transfer if we'd remove
 	// ourselves, preferring a successor that is already in the desired peer set.
 	ourPeerId := n.ID()
-	if remove := s.selectPeerToRemove(ourPeerId, actual, evicted); remove == ourPeerId {
-		n.StepDown(s.selectStepDownPreferred(ourPeerId, actual, desiredPeers))
-	} else {
-		n.ProposeRemovePeer(remove)
+	remove := s.selectPeerToRemove(ourPeerId, actual, evicted)
+	if remove == ourPeerId {
+		err := n.StepDown(s.selectStepDownPreferred(ourPeerId, actual, desiredPeers))
+		return mstat(migrationStatusMembership, "stepping down, evicted from group").withErr(err)
 	}
-	return true
+	err := n.ProposeRemovePeer(remove)
+	return mstat(migrationStatusMembership, "removing evicted peer %s", s.serverNameForNode(remove)).withErr(err)
 }
 
 // extendPeerSet extends the actual peer set through the log, but only with peers
 // that are part of the desired set.
-// Returns true if we've acted, and the migration must wait for the next cycle.
-func (s *Server) extendPeerSet(n RaftNode, actual []*Peer, actualPeers, current, desiredPeers []string) bool {
+// Returns a status if we've acted, and the migration must wait for the next cycle.
+func (s *Server) extendPeerSet(n RaftNode, actual []*Peer, actualPeers, current, desiredPeers []string) migrationStatus {
 	var candidates []string
 	for _, peer := range current {
 		if !slices.Contains(actualPeers, peer) && slices.Contains(desiredPeers, peer) {
@@ -4373,24 +4444,26 @@ func (s *Server) extendPeerSet(n RaftNode, actual []*Peer, actualPeers, current,
 		}
 	}
 	if len(candidates) == 0 {
-		return false
+		return migrationStatus{}
 	}
-	if add := s.selectPeerToAdd(n, n.ID(), actual, candidates); add != _EMPTY_ {
-		n.ProposeAddPeer(add)
+	add := s.selectPeerToAdd(n, n.ID(), actual, candidates)
+	if add == _EMPTY_ {
+		return mstat(migrationStatusQuorum, "waiting for quorum to add peer")
 	}
-	return true
+	err := n.ProposeAddPeer(add)
+	return mstat(migrationStatusMembership, "adding peer %s", s.serverNameForNode(add)).withErr(err)
 }
 
 // Migrate a stream from peer set A to peer set B.
-func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n RaftNode, leaderTerm uint64) {
+func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n RaftNode, leaderTerm uint64) migrationStatus {
 	if leaderTerm == 0 {
-		return
+		return migrationStatus{}
 	}
 	ourPeerId, s := n.ID(), js.srv
 
 	// Sanity-check: we're still the leader.
 	if !n.Leader() {
-		return
+		return migrationStatus{}
 	}
 
 	// Store whether any peers are currently being caught up, in which case they're
@@ -4404,11 +4477,11 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 	// We are shutting down.
 	if cc == nil || cc.meta == nil {
 		js.mu.RUnlock()
-		return
+		return mstat(migrationStatusUnavailable, "shutting down")
 	}
 	if sa == nil || sa.Group == nil {
 		js.mu.RUnlock()
-		return
+		return mstat(migrationStatusUnavailable, "no stream assignment")
 	}
 	meta := cc.meta
 	accName, streamName, replicas := sa.Client.serviceAccount(), sa.Config.Name, sa.Config.Replicas
@@ -4423,36 +4496,42 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 	}
 	if needDesired {
 		sendMetaUpdate()
-		return
+		return mstat(migrationStatusMeta, "requesting desired state from meta leader")
 	}
 	// A snapshot is required. Automatically installs a snapshot for a R1 scaleup.
 	if n.NeedSnapshot() {
-		if err := mset.flushAllPending(); err == nil {
-			n.InstallSnapshot(mset.stateSnapshot(), true)
+		if err := mset.flushAllPending(); err != nil {
+			if errors.Is(err, ErrStoreClosed) {
+				return mstat(migrationStatusUnavailable, "shutting down")
+			}
+			return mstat(migrationStatusSnapshot, "waiting to flush pending state for snapshot").withErr(err)
 		}
-		return
+		if err := n.InstallSnapshot(mset.stateSnapshot(), true); err != nil {
+			return mstat(migrationStatusSnapshot, "waiting to install snapshot").withErr(err)
+		}
+		return mstat(migrationStatusSnapshot, "installing snapshot")
 	}
 	// If a membership change is in progress, we just wait for it to clear.
 	if n.MembershipChangeInProgress() {
-		return
+		return mstat(migrationStatusMembership, "waiting for membership change to commit")
 	}
 
 	actual := n.Peers()
 	actualPeers := peerIDs(actual)
 
 	// Remove any peers that have been evicted from the cluster.
-	if s.removeEvictedPeers(n, meta, actual, actualPeers, current, desiredPeers) {
-		return
+	if st := s.removeEvictedPeers(n, meta, actual, actualPeers, current, desiredPeers); st.isSet() {
+		return st
 	}
 	// Extend the actual peer set through the log.
-	if s.extendPeerSet(n, actual, actualPeers, current, desiredPeers) {
-		return
+	if st := s.extendPeerSet(n, actual, actualPeers, current, desiredPeers); st.isSet() {
+		return st
 	}
 	// If scaling down, we need to select where to.
 	if desiredScaleDown {
 		update.ScaleDownPeers = s.selectScaleDownPeers(ourPeerId, actual, desiredPeers, replicas)
 		sendMetaUpdate()
-		return
+		return mstat(migrationStatusMeta, "selecting peers to scale down to")
 	}
 
 	// Add peers in our desired peer set.
@@ -4472,7 +4551,7 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 		}
 		update.MetaPeers = combined
 		sendMetaUpdate()
-		return
+		return mstat(migrationStatusMeta, "expanding assignment with desired peers")
 	}
 
 	slices.Sort(current)
@@ -4496,7 +4575,7 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 		if sa.Group == nil || sa.Group.Desired == nil || sa.Group.Desired.ID != desiredID {
 			// The desired state moved on under us, reassess on the next cycle.
 			js.mu.RUnlock()
-			return
+			return mstat(migrationStatusMeta, "desired state changed, reassessing")
 		}
 		var blockedBy string
 		for name, c := range sa.consumers {
@@ -4519,7 +4598,7 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 			s.Debugf("Scale down of '%s > %s' blocked by consumer '%s'", accName, streamName, blockedBy)
 			// We need to wait but still nudge the meta leader since it might need to remap consumers.
 			sendMetaUpdate()
-			return
+			return mstat(migrationStatusBlocked, "waiting for consumer '%s' to migrate", blockedBy)
 		}
 
 		// Remove old peers one at a time, the leader selected last.
@@ -4540,35 +4619,52 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 			}
 		}
 		if quorum := (len(actual)-1)/2 + 1; currentCount < quorum {
-			return
+			return mstat(migrationStatusCatchup, "waiting for peers to catch up before removing %s", s.serverNameForNode(remove))
 		}
 		// If we have current desired peers, and we're not a desired peer ourselves, step down.
 		if len(currentDesired) > 0 && !slices.Contains(desiredPeers, ourPeerId) {
 			// If desired peers are still catching up, we wait for a quorum of them to complete for now.
 			if quorum := len(desiredPeers)/2 + 1; len(currentDesired) < quorum {
-				return
+				return mstat(migrationStatusCatchup, "waiting for desired peers to catch up")
 			}
-			if preferred := s.selectStepDownPreferred(ourPeerId, actual, currentDesired); preferred != _EMPTY_ {
-				n.StepDown(preferred)
+			preferred := s.selectStepDownPreferred(ourPeerId, actual, currentDesired)
+			if preferred == _EMPTY_ {
+				return mstat(migrationStatusMembership, "waiting for a desired peer to step down to")
 			}
-			return
+			err := n.StepDown(preferred)
+			return mstat(migrationStatusMembership, "stepping down to %s", s.serverNameForNode(preferred)).withErr(err)
 		}
 
 		// Step down and perform a leader transfer if we'd remove ourselves. We are
 		// selected last, so leadership changes at most once, and every remaining
 		// member is already in the desired peer set so any successor works.
 		if remove != ourPeerId {
-			n.ProposeRemovePeer(remove)
-		} else {
-			n.StepDown()
+			err := n.ProposeRemovePeer(remove)
+			return mstat(migrationStatusMembership, "removing peer %s", s.serverNameForNode(remove)).withErr(err)
 		}
-		return
+		err := n.StepDown()
+		return mstat(migrationStatusMembership, "stepping down before removing ourselves").withErr(err)
 	}
 
 	// We're done.
 	update.MetaPeers = actualPeers
 	update.PeersMatch = exactMatch
 	sendMetaUpdate()
+	if !exactMatch {
+		return mstat(migrationStatusMembership, "waiting for peer set to settle")
+	}
+	return migrationStatus{}
+}
+
+// setMigrationStatus records what the group leader is currently doing to converge
+// this group toward its desired state, so it can be reported through clusterInfo.
+func (js *jetStream) setMigrationStatus(rg *raftGroup, status migrationStatus) {
+	if js == nil || rg == nil {
+		return
+	}
+	js.mu.Lock()
+	defer js.mu.Unlock()
+	rg.migration = status
 }
 
 // Determine if we are migrating
@@ -5436,7 +5532,15 @@ func (js *jetStream) processStreamLeaderChange(mset *stream, isLeader bool, term
 	s, account, err := js.srv, sa.Client.serviceAccount(), sa.err
 	client, subject, reply := sa.Client, sa.Subject, sa.Reply
 	hasResponded := sa.markResponded()
+	// A migration status is only valid for the leader and term that wrote it.
+	clearMigration := sa.Group.migration.isSet()
 	js.mu.RUnlock()
+
+	if clearMigration {
+		js.mu.Lock()
+		sa.Group.migration = migrationStatus{}
+		js.mu.Unlock()
+	}
 
 	streamName := mset.name()
 
@@ -5701,6 +5805,7 @@ func (js *jetStream) processStreamAssignment(sa *streamAssignment) {
 			// Copy over private existing state from former SA.
 			if sa.Group != nil {
 				sa.Group.node = osa.Group.node
+				sa.Group.migration = osa.Group.migration
 			}
 			sa.consumers = osa.consumers
 			if osa.hasResponded() {
@@ -5824,6 +5929,7 @@ func (js *jetStream) processUpdateStreamAssignment(sa *streamAssignment) {
 	// Copy over private existing state from former SA.
 	if sa.Group != nil {
 		sa.Group.node = osa.Group.node
+		sa.Group.migration = osa.Group.migration
 	}
 	sa.consumers = osa.consumers
 	sa.err = osa.err
@@ -6577,6 +6683,7 @@ func (js *jetStream) processConsumerAssignment(ca *consumerAssignment) {
 		// Copy over private existing state from former CA.
 		if ca.Group != nil {
 			ca.Group.node = oca.Group.node
+			ca.Group.migration = oca.Group.migration
 		}
 		if oca.hasResponded() {
 			ca.markResponded()
@@ -7469,6 +7576,8 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 			mmt.Stop()
 			mmt, mmtc = nil, nil
 		}
+		// Don't leave a stale status behind for a migration that's done or abandoned.
+		js.setMigrationStatus(o.raftGroup(), migrationStatus{})
 	}
 	defer stopMigrationMonitoring()
 
@@ -7595,7 +7704,9 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 			}
 			// Reset to the slower fallback speed.
 			resetMigrationMonitoring(migrateFallbackCheckInterval)
-			js.runConsumerMigration(o, ca, n, leaderTerm)
+			// Write the status through the live group, so it lands where clusterInfo
+			// reads it even if the assignment was swapped since our last update.
+			js.setMigrationStatus(o.raftGroup(), js.runConsumerMigration(o, ca, n, leaderTerm))
 
 		case <-t.C:
 			// Start forcing snapshots if they failed previously.
@@ -7605,16 +7716,16 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 	}
 }
 
-// Migrate a consumer from peer set A to peer set B. Returns true when migration is done.
-func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n RaftNode, leaderTerm uint64) {
+// Migrate a consumer from peer set A to peer set B.
+func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n RaftNode, leaderTerm uint64) migrationStatus {
 	if leaderTerm == 0 {
-		return
+		return migrationStatus{}
 	}
 	ourPeerId, s := n.ID(), js.srv
 
 	// Sanity-check: we're still the leader.
 	if !n.Leader() {
-		return
+		return migrationStatus{}
 	}
 
 	// Snapshot the assignment state we need up front, so the Raft reads below don't
@@ -7624,11 +7735,11 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 	// We are shutting down.
 	if cc == nil || cc.meta == nil {
 		js.mu.RUnlock()
-		return
+		return mstat(migrationStatusUnavailable, "shutting down")
 	}
 	if ca == nil || ca.Group == nil {
 		js.mu.RUnlock()
-		return
+		return mstat(migrationStatusUnavailable, "no consumer assignment")
 	}
 	meta := cc.meta
 	accName, streamName, consumerName := ca.Client.serviceAccount(), ca.Stream, ca.Name
@@ -7636,7 +7747,7 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 	osa := js.streamAssignment(accName, streamName)
 	if osa == nil {
 		js.mu.RUnlock()
-		return
+		return mstat(migrationStatusUnavailable, "no stream assignment")
 	}
 
 	replicas := ca.Config.replicas(osa.Config)
@@ -7653,36 +7764,43 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 	}
 	if needDesired {
 		sendMetaUpdate()
-		return
+		return mstat(migrationStatusMeta, "requesting desired state from meta leader")
 	}
 	// A snapshot is required. Automatically installs a snapshot for a R1 scaleup.
 	if n.NeedSnapshot() {
-		if snap, err := o.store.EncodedState(); err == nil {
-			n.InstallSnapshot(snap, true)
+		snap, err := o.store.EncodedState()
+		if err != nil {
+			if errors.Is(err, ErrStoreClosed) {
+				return mstat(migrationStatusUnavailable, "shutting down")
+			}
+			return mstat(migrationStatusSnapshot, "waiting to encode state for snapshot").withErr(err)
 		}
-		return
+		if err := n.InstallSnapshot(snap, true); err != nil {
+			return mstat(migrationStatusSnapshot, "waiting to install snapshot").withErr(err)
+		}
+		return mstat(migrationStatusSnapshot, "installing snapshot")
 	}
 	// If a membership change is in progress, we just wait for it to clear.
 	if n.MembershipChangeInProgress() {
-		return
+		return mstat(migrationStatusMembership, "waiting for membership change to commit")
 	}
 
 	actual := n.Peers()
 	actualPeers := peerIDs(actual)
 
 	// Remove any peers that have been evicted from the cluster.
-	if s.removeEvictedPeers(n, meta, actual, actualPeers, current, desiredPeers) {
-		return
+	if st := s.removeEvictedPeers(n, meta, actual, actualPeers, current, desiredPeers); st.isSet() {
+		return st
 	}
 	// Extend the actual peer set through the log.
-	if s.extendPeerSet(n, actual, actualPeers, current, desiredPeers) {
-		return
+	if st := s.extendPeerSet(n, actual, actualPeers, current, desiredPeers); st.isSet() {
+		return st
 	}
 	// If scaling down, we need to select where to.
 	if desiredScaleDown {
 		update.ScaleDownPeers = s.selectScaleDownPeers(ourPeerId, actual, desiredPeers, replicas)
 		sendMetaUpdate()
-		return
+		return mstat(migrationStatusMeta, "selecting peers to scale down to")
 	}
 
 	// Add peers in our desired peer set.
@@ -7707,11 +7825,11 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 			combined = append(combined, peer)
 		}
 		if len(combined) == len(current) {
-			return
+			return mstat(migrationStatusBlocked, "waiting for stream to migrate first")
 		}
 		update.MetaPeers = combined
 		sendMetaUpdate()
-		return
+		return mstat(migrationStatusMeta, "expanding assignment with desired peers")
 	}
 
 	slices.Sort(current)
@@ -7733,17 +7851,21 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 		// member is already in the desired peer set so any successor works.
 		remove := s.selectPeerToRemove(ourPeerId, actual, remaining)
 		if remove == ourPeerId {
-			n.StepDown()
-		} else {
-			n.ProposeRemovePeer(remove)
+			err := n.StepDown()
+			return mstat(migrationStatusMembership, "stepping down before removing ourselves").withErr(err)
 		}
-		return
+		err := n.ProposeRemovePeer(remove)
+		return mstat(migrationStatusMembership, "removing peer %s", s.serverNameForNode(remove)).withErr(err)
 	}
 
 	// We're done.
 	update.MetaPeers = actualPeers
 	update.PeersMatch = exactMatch
 	sendMetaUpdate()
+	if !exactMatch {
+		return mstat(migrationStatusMembership, "waiting for peer set to settle")
+	}
+	return migrationStatus{}
 }
 
 // Determine if we are migrating
@@ -8133,7 +8255,15 @@ func (js *jetStream) processConsumerLeaderChangeWithAssignment(o *consumer, ca *
 	s, account, err := js.srv, ca.Client.serviceAccount(), ca.err
 	client, subject, reply, streamName, consumerName, sourcing := ca.Client, ca.Subject, ca.Reply, ca.Stream, ca.Name, ca.Config.Sourcing
 	hasResponded := ca.markResponded()
+	// A migration status is only valid for the leader and term that wrote it.
+	clearMigration := ca.Group.migration.isSet()
 	js.mu.RUnlock()
+
+	if clearMigration {
+		js.mu.Lock()
+		ca.Group.migration = migrationStatus{}
+		js.mu.Unlock()
+	}
 
 	acc, _ := s.LookupAccount(account)
 	if acc == nil {
@@ -12477,6 +12607,17 @@ func (js *jetStream) clusterInfo(rg *raftGroup) *ClusterInfo {
 		// the set that the group leader selects the peers to scale down to from.
 		if !d.ScaleDown {
 			desiredPeers = copyStrings(d.Peers)
+		}
+	}
+	// The group leader can have a status before desired state exists, most importantly
+	// when it's still requesting it from the meta leader. Report that on its own.
+	if m := rg.migration; m.Line != _EMPTY_ {
+		if desired == nil {
+			desired = &DesiredClusterInfo{}
+		}
+		desired.Status, desired.StatusType = m.Line, string(m.Type)
+		if m.Err != nil {
+			desired.StatusErr = m.Err.Error()
 		}
 	}
 	js.mu.RUnlock()

@@ -14148,3 +14148,73 @@ func TestJetStreamClusterMetaReplicasInJsz(t *testing.T) {
 		return nil
 	})
 }
+
+func TestJetStreamClusterMigrationStatusReportedInClusterInfo(t *testing.T) {
+	js := &jetStream{srv: &Server{}}
+
+	newGroup := func(desired *desiredRaftGroup) *raftGroup {
+		return &raftGroup{
+			Name:    "test",
+			Peers:   []string{"a"},
+			node:    &raft{},
+			Desired: desired,
+		}
+	}
+
+	// A status without any desired state must still be reported, on an otherwise
+	// empty desired block. This is what a group requesting desired state looks like.
+	rg := newGroup(nil)
+	js.setMigrationStatus(rg, mstat(migrationStatusMeta, "requesting desired state from meta leader"))
+	ci := js.clusterInfo(rg)
+	require_NotNil(t, ci.Desired)
+	require_Equal(t, ci.Desired.Status, "requesting desired state from meta leader")
+	require_Equal(t, ci.Desired.StatusType, "meta")
+	require_Equal(t, ci.Desired.StatusErr, _EMPTY_)
+	require_Equal(t, ci.Desired.Name, _EMPTY_)
+	require_Len(t, len(ci.Desired.Replicas), 0)
+
+	// With desired state the status sits alongside it, and doesn't disturb it.
+	rg = newGroup(&desiredRaftGroup{ID: "id", Cluster: "C1", Peers: []string{"a", "b"}})
+	js.setMigrationStatus(rg, mstat(migrationStatusMembership, "adding peer %s", "s2"))
+	ci = js.clusterInfo(rg)
+	require_NotNil(t, ci.Desired)
+	require_Equal(t, ci.Desired.Status, "adding peer s2")
+	require_Equal(t, ci.Desired.StatusType, "membership")
+	require_Equal(t, ci.Desired.Name, "C1")
+	require_Len(t, len(ci.Desired.Replicas), 2)
+
+	// A persistent fault is reported beside the line, leaving the line itself stable.
+	rg = newGroup(nil)
+	diskErr := errors.New("no space left on device")
+	js.setMigrationStatus(rg, mstat(migrationStatusSnapshot, "waiting to encode state for snapshot").withErr(diskErr))
+	ci = js.clusterInfo(rg)
+	require_NotNil(t, ci.Desired)
+	require_Equal(t, ci.Desired.Status, "waiting to encode state for snapshot")
+	require_Equal(t, ci.Desired.StatusType, "snapshot")
+	require_Equal(t, ci.Desired.StatusErr, "no space left on device")
+
+	// Errors that resolve themselves on the next cycle must not be reported, they'd
+	// only flap in and out of stream info while the migration is healthy.
+	for _, benign := range []error{ErrStoreClosed, errNotLeader, errNodeClosed, errMembershipChange, errNoSnapAvailable} {
+		rg = newGroup(nil)
+		js.setMigrationStatus(rg, mstat(migrationStatusMembership, "adding peer s2").withErr(benign))
+		ci = js.clusterInfo(rg)
+		require_NotNil(t, ci.Desired)
+		require_Equal(t, ci.Desired.Status, "adding peer s2")
+		require_Equal(t, ci.Desired.StatusErr, _EMPTY_)
+	}
+
+	// A converged group reports desired state without a status.
+	rg = newGroup(&desiredRaftGroup{ID: "id", Cluster: "C1", Peers: []string{"a", "b"}})
+	ci = js.clusterInfo(rg)
+	require_NotNil(t, ci.Desired)
+	require_Equal(t, ci.Desired.Status, _EMPTY_)
+	require_Equal(t, ci.Desired.StatusType, _EMPTY_)
+
+	// Clearing the status must not leave an empty desired block behind.
+	rg = newGroup(nil)
+	js.setMigrationStatus(rg, mstat(migrationStatusSnapshot, "installing snapshot"))
+	js.setMigrationStatus(rg, migrationStatus{})
+	ci = js.clusterInfo(rg)
+	require_True(t, ci.Desired == nil)
+}
